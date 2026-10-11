@@ -83,6 +83,33 @@ def _requantize_linears_to_bnb4(model: Any, compute_dtype: Any) -> Any:
     return model
 
 
+def _no_split_module_classes(model: Any) -> list[str] | None:
+    """Return Accelerate-compatible, flat module class names.
+
+    PEFT wrappers may aggregate ``_no_split_modules`` from their children as
+    nested sets.  Accelerate expects a flat iterable of hashable class-name
+    strings and otherwise fails while constructing its device map.
+    """
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    raw = getattr(base_model, "_no_split_modules", None)
+    if raw is None:
+        return None
+
+    pending = [raw]
+    names: set[str] = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            names.add(value)
+        elif isinstance(value, type):
+            names.add(value.__name__)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            pending.extend(value)
+        else:
+            raise TypeError(f"Unsupported _no_split_modules value: {value!r}")
+    return sorted(names) or None
+
+
 def _load_model_and_tokenizer(
     config: ExperimentConfig, model_path: str | None, resume_adapter: Path | None
 ):
@@ -205,7 +232,7 @@ def _load_model_and_tokenizer(
             weight_budget_gib = min(requested_gib, max(1, physical_gib - 4))
             max_memory[index] = f"{weight_budget_gib}GiB"
         max_memory["cpu"] = "150GiB"
-        no_split = getattr(model, "_no_split_modules", None)
+        no_split = _no_split_module_classes(model)
         balanced_memory = get_balanced_memory(
             model,
             max_memory=max_memory,
