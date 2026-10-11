@@ -128,11 +128,6 @@ def run_training_loop(
         raise ValueError("target_steps must be positive")
     if max_collections < 1:
         raise ValueError("max_collections must be positive")
-    if config.rollout.managed_vllm and not rollout_model_path:
-        raise ValueError(
-            "Managed vLLM requires --rollout-model-path pointing to the byte-packed NF4 view"
-        )
-
     work_dir.mkdir(parents=True, exist_ok=True)
     state_path = work_dir / "loop_state.json"
     if state_path.exists():
@@ -168,7 +163,7 @@ def run_training_loop(
             )
             with rollout_models_yaml(
                 config=collection_config,
-                model_path=rollout_model_path or config.model.name_or_path,
+                model_path=rollout_model_path or model_path or config.model.name_or_path,
                 adapter=current_adapter,
                 work_dir=work_dir / "vllm" / f"collection_{collection_index:04d}",
                 external_models_yaml=models_yaml,

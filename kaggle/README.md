@@ -1,8 +1,7 @@
 # Kaggle 4×L4: FSDP + QLoRA + NF4 rollout
 
-Notebook работает с выключенным Internet. Managed loop использует два
-постоянных storage-представления одних NF4-байтов и сам чередует vLLM PP=4 с
-FSDP `FULL_SHARD`=4.
+Notebook работает с выключенным Internet. Managed loop использует один
+постоянный NF4 checkpoint и сам чередует vLLM PP=4 с FSDP `FULL_SHARD`=4.
 Одновременно эти процессы не живут: перед training vLLM завершается и отдаёт
 всю VRAM.
 
@@ -27,7 +26,7 @@ SHA256 Linux-wheel `bitsandbytes==0.48.1`. vLLM 0.19.1 использует со
 2. `google/gemma-4`, вариант `gemma-4-31b-it-qat-w4a16-ct`;
 3. `metric/gemma-4-developer-agent-wheelhouse`;
 4. `timurakimoff/gemma-grpo-source`;
-5. со второй сессии — обе сохранённые NF4-директории предыдущей версии notebook.
+5. со второй сессии — сохранённый NF4 checkpoint предыдущей версии notebook.
 
 Accelerator: `GPU L4 ×4`. Internet: Off.
 
@@ -136,7 +135,7 @@ print("competition data:", data_root)
 print("bitsandbytes:", bnb_wheel.name)
 ```
 
-## Ячейка 2 — выбрать или один раз создать две NF4 storage-view
+## Ячейка 2 — выбрать или один раз создать NF4 checkpoint
 
 ```python
 import torch
@@ -179,32 +178,12 @@ if not is_nf4(NF4_DIR, {"bfloat16", "torch.bfloat16"}):
         cwd=PROJECT,
     )
 
-mounted_vllm_nf4 = [
-    path.parent
-    for path in INPUT.rglob("config.json")
-    if is_nf4(path.parent, {"uint8", "torch.uint8"})
-]
-VLLM_NF4_DIR = mounted_vllm_nf4[0] if mounted_vllm_nf4 else Path(
-    "/kaggle/working/models/gemma-4-31b-nf4-vllm"
-)
-if not is_nf4(VLLM_NF4_DIR, {"uint8", "torch.uint8"}):
-    subprocess.run(
-        [
-            "gemma-grpo", "prepare-vllm-nf4",
-            "--source-model", str(NF4_DIR),
-            "--output-dir", str(VLLM_NF4_DIR),
-        ],
-        check=True,
-        cwd=PROJECT,
-    )
-
-print("persistent FSDP NF4 checkpoint:", NF4_DIR)
-print("persistent vLLM NF4 view:", VLLM_NF4_DIR)
+print("persistent shared NF4 checkpoint:", NF4_DIR)
 ```
 
-Только первый шаг распаковывает W4 и квантует веса. `prepare-vllm-nf4` лишь
-побитово меняет storage layout BF16→uint8, не деквантуя и не переквантуя NF4.
-Сохраните обе директории как notebook output для следующих сессий.
+Только первый шаг распаковывает W4 и квантует веса. Managed vLLM потоково
+создаёт uint8 views поверх загружаемых packed BF16 tensors; на диске ничего не
+дублируется. Сохраните эту директорию как notebook output для следующих сессий.
 
 ## Ячейка 3 — preflight
 
@@ -217,15 +196,14 @@ subprocess.run(
         "--snapshots-dir", str(data_root / "snapshots"),
         "--submission-dir", str(PROJECT / "submission"),
         "--model-path", str(NF4_DIR),
-        "--rollout-model-path", str(VLLM_NF4_DIR),
     ],
     check=True,
     cwd=PROJECT,
 )
 ```
 
-Preflight должен подтвердить BNB ≥0.48.1, BF16-storage FSDP checkpoint,
-byte-packed rollout view, встроенный BNB loader и четыре CUDA device.
+Preflight должен подтвердить BNB ≥0.48.1, общий BF16-storage NF4 checkpoint,
+runtime bitcast shim, встроенный BNB loader и четыре CUDA device.
 
 ## Ячейка 4 — обязательный smoke
 
@@ -248,7 +226,6 @@ command = [
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
     "--model-path", str(NF4_DIR),
-    "--rollout-model-path", str(VLLM_NF4_DIR),
     "--task-id", TASK_IDS[0],
     "--work-dir", str(smoke_dir),
     "--target-steps", "1",
@@ -302,7 +279,6 @@ command = [
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
     "--model-path", str(NF4_DIR),
-    "--rollout-model-path", str(VLLM_NF4_DIR),
     "--work-dir", str(run_dir),
     "--target-steps", "100",
     "--max-collections", "200",

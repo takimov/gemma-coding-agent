@@ -1,33 +1,31 @@
 # Аудит FSDP-QLoRA GRPO path
 
 Дата: 2026-10-11. Цель: Gemma 4 31B, Kaggle 4×NVIDIA L4 22 GiB,
-rollout и training на одних NF4-значениях в двух lossless storage-view.
+rollout и training из одного сохранённого NF4 checkpoint.
 
 ## Новый lifecycle
 
 ```text
-saved BF16-storage NF4 base ──lossless bitcast──▶ byte-packed NF4 view
-           │                                      │
-           │                                      └─ vLLM built-in BNB, PP=4
-           │                                         → SWEGemma rollouts → stop
-           └─ 4 train ranks, FSDP FULL_SHARD + QLoRA → save LoRA adapter
-                                                               │
-                                                               └─ next rollout
+saved BF16-storage NF4 base
+    ├─ streaming lossless uint8 views → vLLM built-in BNB, PP=4
+    │                                  → SWEGemma rollouts → stop
+    └─ 4 train ranks, FSDP FULL_SHARD + QLoRA → save LoRA adapter
+                                                    │
+                                                    └─ next rollout
 ```
 
 Оригинальный competition W4 checkpoint участвует только в одноразовой
-`convert-nf4`. `prepare-vllm-nf4` один раз создаёт byte-packed view простым
-bitcast с сохранением всех байтов. Каждый следующий collect/train перечитывает
-своё представление NF4 с диска, но не распаковывает W4 и не делает повторную
-квантизацию.
+`convert-nf4`. Каждый следующий collect/train перечитывает один NF4 checkpoint
+с диска. vLLM bitcast'ит только загружаемые packed tensors в RAM; W4 не
+распаковывается, повторной квантизации и второй 17 GiB копии на диске нет.
 
 ## Что исправлено
 
 | Приоритет | Проблема | Решение |
 |---|---|---|
 | P0 | Последовательный `device_map` нагружал GPU по очереди | Четыре FSDP rank, `FULL_SHARD`, одна trajectory/rank |
-| P0 | Каждый update делал W4 → BF16 → NF4 | Постоянные FSDP и vLLM storage-view одного pre-quantized NF4 base |
-| P0 | Rollout был W4, training NF4 | Managed vLLM читает byte-packed view тех же NF4-байтов; view создаётся bitcast без requantization |
+| P0 | Каждый update делал W4 → BF16 → NF4 | Один постоянный pre-quantized NF4 checkpoint |
+| P0 | Rollout был W4, training NF4 | Managed vLLM читает те же NF4-байты через streaming uint8 view без requantization |
 | P0 | Внешний BNB plugin новее vLLM 0.19.1 | Используется встроенный loader 0.19.1, внешний plugin отключён через `VLLM_PLUGINS=""` |
 | P0 | vLLM 0.19 не поддерживает pre-quantized BNB при TP>1 | Rollout использует PP=4 и сохраняет quantized tensors целыми |
 | P0 | Полный FP32 `action_tokens × 262144` tensor давал OOM 6.42 GiB | Selective hidden states и chunked lm_head/log-softmax |
@@ -130,7 +128,7 @@ eval перед отправкой; это eval, а не возврат W4 в tr
 
 ## Критерии успешного smoke
 
-1. Preflight подтверждает BNB ≥0.48.1, BF16 FSDP checkpoint, byte-packed rollout view, встроенный BNB loader и 4 GPU.
+1. Preflight подтверждает BNB ≥0.48.1, общий NF4 checkpoint, runtime shim, встроенный BNB loader и 4 GPU.
 2. vLLM запускает NF4 PP=4, возвращает `/v1/models`, собирает 4 scorable rollout'а.
 3. Перед training в логе есть `[vllm] stopped`.
 4. FSDP world size равен 4; каждый rank получает trajectory.

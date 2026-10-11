@@ -46,8 +46,8 @@ rollout:
   # Kept in submission/eval_config.yaml; null avoids relying on a version-specific CLI flag.
   timeout_seconds: null
   seeds: [101, 202, 303, 404]
-  # The loop owns vLLM: it starts the byte-packed view for collection and stops
-  # it before spawning four FSDP ranks on the BF16-storage checkpoint.
+  # The loop owns vLLM: it streams byte views from the shared BF16-storage NF4
+  # checkpoint, then stops before spawning four FSDP ranks on the same files.
   managed_vllm: true
   vllm_port: 8000
   # Pre-quantized BNB uses pipeline rather than tensor parallelism in vLLM 0.19.

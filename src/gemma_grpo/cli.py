@@ -9,7 +9,7 @@ from .config import load_config
 from .export import export_submission
 from .loop import run_training_loop
 from .monitoring import summarize_telemetry
-from .nf4 import convert_to_nf4_checkpoint, prepare_vllm_nf4_checkpoint
+from .nf4 import convert_to_nf4_checkpoint
 from .preflight import run_preflight
 from .train import train_adapter
 from .vllm_server import rollout_models_yaml
@@ -53,13 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
     convert_nf4.add_argument("--output-dir", required=True)
     convert_nf4.add_argument("--trust-remote-code", action="store_true")
     convert_nf4.add_argument("--max-shard-size", default="4GB")
-
-    prepare_vllm_nf4 = subparsers.add_parser(
-        "prepare-vllm-nf4",
-        help="losslessly bitcast the FSDP NF4 checkpoint for vLLM 0.19",
-    )
-    prepare_vllm_nf4.add_argument("--source-model", required=True)
-    prepare_vllm_nf4.add_argument("--output-dir", required=True)
 
     train = subparsers.add_parser("train", help="perform one on-policy artifact GRPO update")
     train.add_argument("--config", default="configs/grpo.yaml")
@@ -148,13 +141,6 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=Path(args.output_dir),
             trust_remote_code=args.trust_remote_code,
             max_shard_size=args.max_shard_size,
-        )
-        print(created)
-        return 0
-    if args.command == "prepare-vllm-nf4":
-        created = prepare_vllm_nf4_checkpoint(
-            source_model=Path(args.source_model),
-            output_dir=Path(args.output_dir),
         )
         print(created)
         return 0

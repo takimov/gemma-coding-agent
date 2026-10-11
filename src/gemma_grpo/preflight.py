@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -14,9 +13,10 @@ import yaml
 from packaging.version import InvalidVersion, Version
 
 from .config import ExperimentConfig
-from .nf4 import assert_nf4_checkpoint, assert_vllm_nf4_checkpoint
+from .nf4 import assert_nf4_checkpoint
 from .tasks import read_jsonl
 from .tokenization import assert_prefix_preserving
+from .vllm_server import vllm_environment
 
 
 PACKAGES = (
@@ -186,22 +186,16 @@ def run_preflight(
         except (OSError, ValueError, json.JSONDecodeError) as error:
             record("saved NF4 checkpoint", False, str(error))
         if config.rollout.managed_vllm:
-            if rollout_model_path is None:
+            rollout_path = rollout_model_path or model_path or config.model.name_or_path
+            try:
+                assert_nf4_checkpoint(rollout_path, require_fsdp_storage=True)
                 record(
-                    "byte-packed rollout NF4 checkpoint",
-                    False,
-                    "missing --rollout-model-path",
+                    "shared rollout NF4 checkpoint",
+                    True,
+                    str(Path(rollout_path)),
                 )
-            else:
-                try:
-                    assert_vllm_nf4_checkpoint(rollout_model_path)
-                    record(
-                        "byte-packed rollout NF4 checkpoint",
-                        True,
-                        str(Path(rollout_model_path)),
-                    )
-                except (OSError, ValueError, json.JSONDecodeError) as error:
-                    record("byte-packed rollout NF4 checkpoint", False, str(error))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                record("shared rollout NF4 checkpoint", False, str(error))
 
     try:
         import torch
@@ -227,16 +221,17 @@ def run_preflight(
         record("CUDA device count", False, str(error))
 
     if config.rollout.managed_vllm:
-        environment = os.environ.copy()
-        environment["VLLM_PLUGINS"] = ""
+        environment = vllm_environment()
         builtin = subprocess.run(
             [
                 sys.executable,
                 "-c",
                 "from vllm.model_executor.layers.quantization.bitsandbytes "
                 "import BitsAndBytesConfig; "
-                "from vllm.model_executor.model_loader.bitsandbytes_loader "
-                "import BitsAndBytesModelLoader; print('ok')",
+                "config=BitsAndBytesConfig.from_config({"
+                "'load_in_4bit': True, 'bnb_4bit_quant_type': 'nf4', "
+                "'bnb_4bit_quant_storage': 'bfloat16'}); "
+                "assert config.bnb_4bit_quant_storage == 'uint8'; print('ok')",
             ],
             text=True,
             stdout=subprocess.PIPE,

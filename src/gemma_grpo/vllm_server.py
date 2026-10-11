@@ -15,11 +15,25 @@ from typing import Iterator, TextIO
 import yaml
 
 from .config import ExperimentConfig
-from .nf4 import assert_vllm_nf4_checkpoint
+from .nf4 import assert_nf4_checkpoint
 
 
 BASE_MODEL_ALIAS = "gemma-4-31b-it-qat-w4a16-ct"
 ADAPTER_ALIAS = "main_lora"
+VLLM_COMPAT_SITE = Path(__file__).with_name("_vllm_site")
+
+
+def vllm_environment() -> dict[str, str]:
+    """Return an environment that patches every spawned vLLM worker."""
+    environment = os.environ.copy()
+    environment.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    environment["VLLM_PLUGINS"] = ""
+    environment["GEMMA_GRPO_VLLM_BNB_COMPAT"] = "1"
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = str(VLLM_COMPAT_SITE) + (
+        os.pathsep + existing if existing else ""
+    )
+    return environment
 
 
 def write_models_yaml(path: Path, *, port: int, adapter: Path | None) -> Path:
@@ -63,10 +77,7 @@ class ManagedVllmServer:
         self.models_yaml = self.work_dir / "models.yaml"
 
     def _supported_flags(self) -> str:
-        environment = os.environ.copy()
-        # vLLM 0.19.1 already ships a built-in BNB loader. The later external
-        # plugin targets a newer vLLM API and must not be auto-loaded here.
-        environment["VLLM_PLUGINS"] = ""
+        environment = vllm_environment()
         completed = subprocess.run(
             [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--help"],
             text=True,
@@ -163,7 +174,7 @@ class ManagedVllmServer:
             return "(vLLM log unavailable)"
 
     def start(self) -> Path:
-        assert_vllm_nf4_checkpoint(self.model_path)
+        assert_nf4_checkpoint(self.model_path, require_fsdp_storage=True)
         if self.adapter is not None:
             for filename in ("adapter_config.json", "adapter_model.safetensors"):
                 if not (self.adapter / filename).is_file():
@@ -175,9 +186,7 @@ class ManagedVllmServer:
             adapter=self.adapter,
         )
         self._log_handle = self.log_path.open("w", encoding="utf-8")
-        environment = os.environ.copy()
-        environment.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-        environment["VLLM_PLUGINS"] = ""
+        environment = vllm_environment()
         command = self._command()
         print(f"[vllm] starting NF4 server; log={self.log_path}", flush=True)
         self.process = subprocess.Popen(

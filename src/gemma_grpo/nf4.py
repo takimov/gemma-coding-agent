@@ -49,20 +49,6 @@ def assert_nf4_checkpoint(path: str | Path, *, require_fsdp_storage: bool = True
             )
 
 
-def assert_vllm_nf4_checkpoint(path: str | Path) -> None:
-    """Require the byte-packed NF4 representation consumed by vLLM 0.19."""
-    assert_nf4_checkpoint(path, require_fsdp_storage=False)
-    storage = str(
-        checkpoint_quantization(path).get("bnb_4bit_quant_storage") or ""
-    ).lower()
-    if storage not in {"uint8", "torch.uint8"}:
-        raise ValueError(
-            "vLLM 0.19 requires byte-packed pre-quantized BNB weights; "
-            f"expected uint8 storage, got {storage or 'missing'} in {path}. "
-            "Run `gemma-grpo prepare-vllm-nf4 --source-model ... --output-dir ...`."
-        )
-
-
 def _requantize_linears_to_nf4(
     model: Any,
     *,
@@ -186,142 +172,6 @@ def _save_nf4_model(model: Any, directory: Path, *, max_shard_size: str) -> str:
         return "canonical"
 
 
-def prepare_vllm_nf4_checkpoint(
-    *,
-    source_model: str | Path,
-    output_dir: str | Path,
-) -> Path:
-    """Create a byte-packed vLLM view without dequantizing NF4 weights.
-
-    FSDP-QLoRA requires floating BNB storage so it can shard Params4bit, while
-    vLLM 0.19's built-in BNB loader allocates byte-packed parameters. The two
-    layouts contain identical quantized bytes. This function bitcasts only the
-    serialized quantized weight tensors from BF16 to uint8; it never reconstructs
-    or requantizes a dense weight.
-    """
-    import gc
-
-    import torch
-    from safetensors import safe_open
-    from safetensors.torch import load_file, save_file
-
-    source_model = Path(source_model).resolve()
-    output_dir = Path(output_dir).resolve()
-    assert_nf4_checkpoint(source_model, require_fsdp_storage=True)
-    if output_dir.exists():
-        if any(output_dir.iterdir()) if output_dir.is_dir() else True:
-            raise FileExistsError(f"Refusing to overwrite existing vLLM checkpoint: {output_dir}")
-        output_dir.rmdir()
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-
-    shards = sorted(source_model.glob("*.safetensors"))
-    if not shards:
-        raise ValueError(f"NF4 checkpoint has no safetensors shards: {source_model}")
-
-    source_bytes = sum(shard.stat().st_size for shard in shards)
-    free_bytes = shutil.disk_usage(output_dir.parent).free
-    reserve_bytes = 2 * 1024**3
-    if free_bytes < source_bytes + reserve_bytes:
-        raise OSError(
-            "Not enough free disk space for the byte-packed vLLM checkpoint: "
-            f"need about {(source_bytes + reserve_bytes) / 2**30:.1f} GiB including "
-            f"a 2 GiB reserve, have {free_bytes / 2**30:.1f} GiB in {output_dir.parent}"
-        )
-
-    checkpoint_keys: set[str] = set()
-    for shard in shards:
-        with safe_open(str(shard), framework="pt", device="cpu") as handle:
-            checkpoint_keys.update(handle.keys())
-    suffixes = (
-        ".quant_state.bitsandbytes__nf4",
-        ".quant_state.bitsandbytes__fp4",
-    )
-    quantized_weights = {
-        key[: -len(suffix)]
-        for key in checkpoint_keys
-        for suffix in suffixes
-        if key.endswith(suffix)
-    }
-    if not quantized_weights:
-        raise ValueError(f"No serialized BNB quantization states found in {source_model}")
-
-    temporary = Path(
-        tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent)
-    )
-    try:
-        shutil.copytree(
-            source_model,
-            temporary,
-            dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns("*.safetensors"),
-        )
-        converted_count = 0
-        for shard in shards:
-            state = load_file(str(shard), device="cpu")
-            converted: dict[str, Any] = {}
-            for key, tensor in state.items():
-                if key in quantized_weights:
-                    if tensor.dtype != torch.bfloat16:
-                        raise ValueError(
-                            f"Expected BF16 quantized storage for {key}, got {tensor.dtype}"
-                        )
-                    tensor = tensor.contiguous().view(torch.uint8).reshape(-1, 1)
-                    converted_count += 1
-                converted[key] = tensor
-            save_file(
-                converted,
-                str(temporary / shard.name),
-                metadata={"format": "pt"},
-            )
-            del state, converted
-            gc.collect()
-
-        if converted_count != len(quantized_weights):
-            raise RuntimeError(
-                f"Converted {converted_count} NF4 weights, expected {len(quantized_weights)}"
-            )
-        config_path = temporary / "config.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        quantization = config.get("quantization_config")
-        if not isinstance(quantization, dict):
-            raise ValueError(f"Invalid quantization_config in {config_path}")
-        quantization["bnb_4bit_quant_storage"] = "uint8"
-        config_path.write_text(
-            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        manifest_path = temporary / NF4_MANIFEST
-        manifest = {}
-        if manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest.update(
-            {
-                "format": "bitsandbytes-nf4-vllm",
-                "source_model": str(source_model),
-                "quant_storage": "uint8",
-                "conversion": "lossless-storage-bitcast",
-                "converted_weights": converted_count,
-                "source_safetensors_bytes": source_bytes,
-            }
-        )
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        assert_vllm_nf4_checkpoint(temporary)
-        os.replace(temporary, output_dir)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
-
-    print(
-        f"[nf4] byte-packed vLLM checkpoint ready: {output_dir} "
-        f"({len(quantized_weights)} weights, no requantization)",
-        flush=True,
-    )
-    return output_dir
-
-
 def convert_to_nf4_checkpoint(
     *,
     source_model: str | Path,
@@ -332,8 +182,8 @@ def convert_to_nf4_checkpoint(
     """Create the reusable BF16-storage NF4 checkpoint for FSDP-QLoRA.
 
     The competition compressed-tensors checkpoint is decompressed only during
-    this command. ``prepare-vllm-nf4`` derives a byte-packed rollout view from
-    this checkpoint without dequantization or another quantization pass.
+    this command. Managed vLLM bitcasts its packed BF16 containers to uint8
+    views while streaming them, without another on-disk checkpoint.
     """
     import torch
     from transformers import (

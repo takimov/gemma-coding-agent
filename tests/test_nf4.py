@@ -8,9 +8,6 @@ from gemma_grpo.nf4 import (
     _replace_source_quantizer_for_save,
     _save_nf4_model,
     assert_nf4_checkpoint,
-    assert_vllm_nf4_checkpoint,
-    checkpoint_quantization,
-    prepare_vllm_nf4_checkpoint,
 )
 
 
@@ -51,72 +48,6 @@ def test_uint8_nf4_checkpoint_is_rejected_for_fsdp(tmp_path):
 
     with pytest.raises(ValueError, match="bfloat16"):
         assert_nf4_checkpoint(model)
-
-
-def test_uint8_nf4_checkpoint_is_accepted_for_vllm(tmp_path):
-    model = tmp_path / "model"
-    _write_config(
-        model,
-        {
-            "quant_method": "bitsandbytes",
-            "load_in_4bit": True,
-            "bnb_4bit_quant_type": "nf4",
-            "bnb_4bit_quant_storage": "uint8",
-        },
-    )
-
-    assert_vllm_nf4_checkpoint(model)
-
-
-def test_bfloat16_nf4_checkpoint_is_rejected_for_vllm(tmp_path):
-    model = tmp_path / "model"
-    _write_config(
-        model,
-        {
-            "quant_method": "bitsandbytes",
-            "load_in_4bit": True,
-            "bnb_4bit_quant_type": "nf4",
-            "bnb_4bit_quant_storage": "bfloat16",
-        },
-    )
-
-    with pytest.raises(ValueError, match="byte-packed"):
-        assert_vllm_nf4_checkpoint(model)
-
-
-def test_prepare_vllm_nf4_bitcasts_quantized_weights_without_requantizing(tmp_path):
-    torch = pytest.importorskip("torch")
-    safetensors_torch = pytest.importorskip("safetensors.torch")
-    source = tmp_path / "source"
-    target = tmp_path / "target"
-    _write_config(
-        source,
-        {
-            "quant_method": "bitsandbytes",
-            "load_in_4bit": True,
-            "bnb_4bit_quant_type": "nf4",
-            "bnb_4bit_quant_storage": "bfloat16",
-        },
-    )
-    quantized = torch.tensor([1.0, -2.0], dtype=torch.bfloat16).reshape(-1, 1)
-    embedding = torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16)
-    safetensors_torch.save_file(
-        {
-            "layer.weight": quantized,
-            "layer.weight.quant_state.bitsandbytes__nf4": torch.tensor([1], dtype=torch.uint8),
-            "embed.weight": embedding,
-        },
-        source / "model.safetensors",
-    )
-
-    prepare_vllm_nf4_checkpoint(source_model=source, output_dir=target)
-
-    saved = safetensors_torch.load_file(target / "model.safetensors")
-    assert saved["layer.weight"].dtype == torch.uint8
-    assert tuple(saved["layer.weight"].shape) == (4, 1)
-    assert torch.equal(saved["layer.weight"].flatten(), quantized.view(torch.uint8).flatten())
-    assert saved["embed.weight"].dtype == torch.bfloat16
-    assert checkpoint_quantization(target)["bnb_4bit_quant_storage"] == "uint8"
 
 
 def test_nf4_save_replaces_compressed_tensor_conversion_state(monkeypatch):
