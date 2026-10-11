@@ -40,6 +40,31 @@ def _mapped_weight_name(loader: Any, original_name: str) -> str:
     return mapped
 
 
+def _complete_gemma4_tied_kv_quant_states(
+    quant_state_dict: dict[str, Any],
+) -> int:
+    """Mirror K quantization metadata for Gemma 4 layers where K is V.
+
+    Gemma 4 checkpoints omit ``v_proj`` for full-attention layers with
+    ``attention_k_eq_v``.  vLLM 0.19.1 duplicates the packed K weight while
+    loading the model, but its generic BitsAndBytes loader only sees the
+    checkpoint names and therefore misses the V ``QuantState``.  The missing
+    third shard makes the BNB linear produce Q+K instead of Q+K+V.
+
+    Sliding-attention layers have a real V state and are left untouched.
+    """
+    additions: dict[str, Any] = {}
+    marker = ".self_attn.k_proj.weight"
+    for key, state in quant_state_dict.items():
+        if marker not in key:
+            continue
+        value_key = key.replace(marker, ".self_attn.v_proj.weight")
+        if value_key not in quant_state_dict:
+            additions[value_key] = state
+    quant_state_dict.update(additions)
+    return len(additions)
+
+
 def _patch_loader_class(loader_class: type) -> None:
     """Bitcast only pre-quantized weights while streaming them from disk."""
     if getattr(loader_class, "_gemma_grpo_bf16_storage_compat", False):
@@ -69,8 +94,27 @@ def _patch_loader_class(loader_class: type) -> None:
                 tensor = tensor.contiguous().view(torch.uint8).reshape(-1, 1)
             yield original_name, tensor
 
+        added = _complete_gemma4_tied_kv_quant_states(quant_state_dict)
+        if added:
+            print(
+                "[gemma-grpo] mirrored "
+                f"{added} Gemma 4 K quantization state(s) for tied V",
+                flush=True,
+            )
+
     loader_class._quantized_4bit_generator = quantized_4bit_generator
     loader_class._gemma_grpo_bf16_storage_compat = True
+
+
+def _patch_intermediate_tensors_class(intermediate_class: type) -> None:
+    """Backport the mapping ``get`` operation used by Gemma4 PP in vLLM."""
+    if hasattr(intermediate_class, "get"):
+        return
+
+    def get(self: Any, key: str, default: Any = None) -> Any:
+        return self.tensors.get(key, default)
+
+    intermediate_class.get = get
 
 
 def install_vllm_bnb_compat() -> None:
@@ -79,9 +123,11 @@ def install_vllm_bnb_compat() -> None:
     from vllm.model_executor.model_loader.bitsandbytes_loader import (
         BitsAndBytesModelLoader,
     )
+    from vllm.sequence import IntermediateTensors
 
     _patch_config_class(BitsAndBytesConfig)
     _patch_loader_class(BitsAndBytesModelLoader)
+    _patch_intermediate_tensors_class(IntermediateTensors)
     print(
         "[gemma-grpo] vLLM BF16-storage NF4 streaming compatibility enabled",
         flush=True,
