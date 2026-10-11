@@ -254,6 +254,8 @@ def run_preflight(
         required_flags = [
             "--tensor-parallel-size",
             "--pipeline-parallel-size",
+            "--max-model-len",
+            "--max-num-seqs",
             "--served-model-name",
             "--quantization",
             "--load-format",
@@ -264,6 +266,8 @@ def run_preflight(
         ]
         if config.rollout.vllm_language_model_only:
             required_flags.append("--language-model-only")
+        if config.rollout.vllm_enforce_eager:
+            required_flags.append("--enforce-eager")
         missing = [flag for flag in required_flags if flag not in completed.stdout]
         record(
             "managed vLLM NF4/LoRA flags",

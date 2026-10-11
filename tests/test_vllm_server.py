@@ -47,7 +47,7 @@ def test_managed_vllm_uses_pipeline_parallel_for_prequantized_nf4(tmp_path, monk
         "_supported_flags",
         lambda: (
             "--quantization --load-format --pipeline-parallel-size "
-            "--language-model-only"
+            "--language-model-only --max-num-seqs --enforce-eager"
         ),
     )
 
@@ -56,6 +56,8 @@ def test_managed_vllm_uses_pipeline_parallel_for_prequantized_nf4(tmp_path, monk
     assert command[command.index("--tensor-parallel-size") + 1] == "1"
     assert command[command.index("--pipeline-parallel-size") + 1] == "4"
     assert command[command.index("--max-model-len") + 1] == "32768"
+    assert command[command.index("--max-num-seqs") + 1] == "1"
+    assert "--enforce-eager" in command
     assert "--language-model-only" in command
 
 

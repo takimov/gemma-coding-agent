@@ -19,6 +19,8 @@ def test_default_config_has_matching_group_and_seeds():
     assert config.rollout.vllm_pipeline_parallel_size == 4
     assert config.rollout.vllm_language_model_only is True
     assert config.rollout.vllm_max_model_len == 32768
+    assert config.rollout.vllm_max_num_seqs == 1
+    assert config.rollout.vllm_enforce_eager is True
     assert config.grpo.logprob_chunk_size == 32
     assert config.grpo.monitor_interval_seconds == 5
 

@@ -30,6 +30,8 @@ class RolloutConfig:
     vllm_pipeline_parallel_size: int = 4
     vllm_language_model_only: bool = True
     vllm_max_model_len: int = 32768
+    vllm_max_num_seqs: int = 1
+    vllm_enforce_eager: bool = True
     vllm_gpu_memory_utilization: float = 0.9
     vllm_startup_timeout_seconds: int = 900
 
@@ -170,6 +172,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("rollout.vllm_pipeline_parallel_size must be positive")
     if config.rollout.vllm_max_model_len < 1:
         raise ValueError("rollout.vllm_max_model_len must be positive")
+    if config.rollout.vllm_max_num_seqs < 1:
+        raise ValueError("rollout.vllm_max_num_seqs must be positive")
     if not 0 < config.rollout.vllm_gpu_memory_utilization < 1:
         raise ValueError("rollout.vllm_gpu_memory_utilization must be between 0 and 1")
     if config.rollout.vllm_startup_timeout_seconds < 1:

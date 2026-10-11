@@ -211,6 +211,10 @@ Rollout context остаётся 32768 независимо от `grpo.max_seq_l
 токенов у inference server.
 Вывод managed vLLM одновременно показывается в stdout notebook и сохраняется в
 `<run>/vllm/collection_NNNN/vllm.log`.
+Для последовательных rollout'ов сервер использует eager execution и
+`max_num_seqs=1`: это исключает CUDA-graph pools, которые после выделения KV
+cache не помещаются в 22 GiB L4. `gpu_memory_utilization=0.85` оставляет запас
+для временных BitsAndBytes buffers.
 
 ## Ячейка 4 — обязательный smoke
 

@@ -57,7 +57,11 @@ rollout:
   vllm_language_model_only: true
   # Gemma 4's full context; SWEGemma requests up to 16k completion tokens.
   vllm_max_model_len: 32768
-  vllm_gpu_memory_utilization: 0.9
+  # Collection concurrency is one, so graph capture and multi-sequence
+  # reservation only consume VRAM without increasing rollout throughput.
+  vllm_max_num_seqs: 1
+  vllm_enforce_eager: true
+  vllm_gpu_memory_utilization: 0.85
   vllm_startup_timeout_seconds: 900
 
 reward:

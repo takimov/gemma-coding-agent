@@ -53,7 +53,11 @@ rollout:
   # SWEGemma requests up to 16k completion tokens.  Keep rollout context
   # independent from the smaller 8k training filter used by this smoke test.
   vllm_max_model_len: 32768
-  vllm_gpu_memory_utilization: 0.9
+  # Rollouts are sequential. Avoid large CUDA-graph pools and reserve headroom
+  # for temporary BitsAndBytes dequantization buffers.
+  vllm_max_num_seqs: 1
+  vllm_enforce_eager: true
+  vllm_gpu_memory_utilization: 0.85
   vllm_startup_timeout_seconds: 900
 reward:
   resolved: 1.0

@@ -124,6 +124,8 @@ class ManagedVllmServer:
             str(rollout.vllm_gpu_memory_utilization),
             "--max-model-len",
             str(rollout.vllm_max_model_len),
+            "--max-num-seqs",
+            str(rollout.vllm_max_num_seqs),
         ]
 
         def add(flag: str, *values: str) -> None:
@@ -136,6 +138,8 @@ class ManagedVllmServer:
         add("--reasoning-parser", "gemma4")
         add("--enable-auto-tool-choice")
         add("--disable-log-requests")
+        if rollout.vllm_enforce_eager:
+            add("--enforce-eager")
         if rollout.vllm_language_model_only:
             add("--language-model-only")
         if "--default-chat-template-kwargs" in flags:
