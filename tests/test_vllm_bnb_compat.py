@@ -105,6 +105,27 @@ def test_intermediate_tensors_patch_adds_mapping_get_and_drops_none():
     assert intermediate.get("missing", "fallback") == "fallback"
 
 
+def test_intermediate_tensors_patch_preserves_async_transport_mapping():
+    class Intermediate:
+        def __init__(self, tensors):
+            self.tensors = tensors
+
+    _patch_intermediate_tensors_class(Intermediate)
+    flattened_placeholder = object()
+    restored_tensor = object()
+    received = {
+        "hidden_states": flattened_placeholder,
+        "residual": None,
+    }
+
+    intermediate = Intermediate(received)
+    received["hidden_states"] = restored_tensor
+
+    assert intermediate.tensors is received
+    assert intermediate.tensors["hidden_states"] is restored_tensor
+    assert "residual" not in intermediate.tensors
+
+
 def test_intermediate_tensors_patch_is_idempotent():
     class Intermediate:
         def __init__(self, tensors):

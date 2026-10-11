@@ -115,8 +115,17 @@ def _patch_intermediate_tensors_class(intermediate_class: type) -> None:
             # vLLM's PP transport slices every dictionary value as a tensor.
             # Gemma4 0.19.1 includes optional PLE inputs even when their value
             # is None, which crashes sync_and_slice_intermediate_tensors.
-            present = {key: value for key, value in tensors.items() if value is not None}
-            original_init(self, present, *args, **kwargs)
+            #
+            # Mutate in place rather than replacing the mapping.  The async PP
+            # receiver initially stores flattened NCCL placeholders in this
+            # dictionary, then its completion callbacks replace those values
+            # with tensors restored to their original shapes.  Copying the
+            # mapping here disconnects IntermediateTensors from those updates
+            # and leaves e.g. hidden_states as a flat token buffer.
+            for key in tuple(tensors):
+                if tensors[key] is None:
+                    del tensors[key]
+            original_init(self, tensors, *args, **kwargs)
 
         intermediate_class.__init__ = init
         intermediate_class._gemma_grpo_optional_tensor_compat = True
