@@ -127,6 +127,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("GRPO requires at least two rollouts per group")
     if config.rollout.sandbox not in {"docker", "subprocess"}:
         raise ValueError("rollout.sandbox must be 'docker' or 'subprocess'")
+    if config.rollout.concurrency < 1:
+        raise ValueError("rollout.concurrency must be positive")
     if config.grpo.epochs < 1:
         raise ValueError("grpo.epochs must be at least 1")
     if config.grpo.max_steps is not None and config.grpo.max_steps < 1:

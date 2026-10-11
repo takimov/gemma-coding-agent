@@ -61,7 +61,7 @@ def test_managed_vllm_uses_tensor_parallel_for_native_w4(tmp_path, monkeypatch):
     assert command[command.index("--tensor-parallel-size") + 1] == "4"
     assert command[command.index("--pipeline-parallel-size") + 1] == "1"
     assert command[command.index("--max-model-len") + 1] == "32768"
-    assert command[command.index("--max-num-seqs") + 1] == "1"
+    assert command[command.index("--max-num-seqs") + 1] == "4"
     assert "--enforce-eager" not in command
     assert "--language-model-only" in command
     assert "--quantization" not in command

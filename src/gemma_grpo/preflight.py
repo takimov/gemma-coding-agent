@@ -195,6 +195,15 @@ def run_preflight(
         config.grpo.group_size == len(config.rollout.seeds) and config.grpo.group_size >= 2,
         f"group_size={config.grpo.group_size}, seeds={len(config.rollout.seeds)}",
     )
+    requested_parallelism = min(config.rollout.concurrency, len(config.rollout.seeds))
+    record(
+        "rollout continuous batching",
+        config.rollout.vllm_max_num_seqs >= requested_parallelism,
+        (
+            f"seed_concurrency={requested_parallelism}, "
+            f"vllm_max_num_seqs={config.rollout.vllm_max_num_seqs}"
+        ),
+    )
 
     path = Path(model_path or config.model.name_or_path)
     if config.model.load_mode == "nf4":

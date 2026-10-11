@@ -4,6 +4,7 @@ import hashlib
 import json
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,7 @@ def attach_behavior_logprobs(
     model: str,
     trust_remote_code: bool,
     timeout_seconds: int = 300,
+    max_workers: int = 1,
 ) -> list[dict[str, Any]]:
     """Record W4 raw-model probabilities for trainable action tokens.
 
@@ -122,14 +124,22 @@ def attach_behavior_logprobs(
         tokenizer_path,
         trust_remote_code=trust_remote_code,
     )
-    total = len(trainable)
-    for index, row in enumerate(trainable, start=1):
+    prepared = [(row, _row_segments(tokenizer, row)) for row in trainable]
+    total = len(prepared)
+    worker_count = min(max_workers, total)
+    print(
+        f"[rollout] scoring W4 behavior logprobs for {total} trajectory(s) "
+        f"with concurrency={worker_count}",
+        flush=True,
+    )
+
+    def score_prepared(item: tuple[int, tuple[dict[str, Any], list[TokenizedTrajectory]]]) -> None:
+        index, (row, segments) = item
         print(
             f"[rollout] scoring W4 behavior logprobs {index}/{total}; "
             f"seed={row.get('seed')}",
             flush=True,
         )
-        segments = _row_segments(tokenizer, row)
         values: list[float] = []
         for segment in segments:
             values.extend(
@@ -143,4 +153,20 @@ def attach_behavior_logprobs(
         row["behavior_logprobs"] = values
         row["behavior_logprob_source"] = "vllm_raw_prompt_logprobs"
         row["behavior_trajectory_id"] = trajectory_fingerprint(segments)
+        print(
+            f"[rollout] scored W4 behavior logprobs {index}/{total}; "
+            f"seed={row.get('seed')}; action_tokens={len(values)}",
+            flush=True,
+        )
+
+    indexed = list(enumerate(prepared, start=1))
+    if worker_count == 1:
+        for item in indexed:
+            score_prepared(item)
+    else:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="gemma-behavior",
+        ) as executor:
+            list(executor.map(score_prepared, indexed))
     return rows

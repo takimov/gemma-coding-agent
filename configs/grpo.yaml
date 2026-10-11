@@ -41,7 +41,8 @@ rollout:
   sandbox: subprocess
   # null uses the image configured by the installed competition harness.
   image: null
-  concurrency: 1
+  # Collect the four GRPO samples concurrently against one batched vLLM.
+  concurrency: 4
   max_tool_calls: 20
   max_time_minutes: 15
   # Kept in submission/eval_config.yaml; null avoids relying on a version-specific CLI flag.
@@ -56,11 +57,10 @@ rollout:
   vllm_pipeline_parallel_size: 1
   # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
   vllm_language_model_only: true
-  # Gemma 4's full context; SWEGemma requests up to 16k completion tokens.
+  # Gemma 4's full context; submission sampling reserves up to 8k per turn.
   vllm_max_model_len: 32768
-  # Keep one sequence for now; native W4 tensor parallelism already restores
-  # the fast inference path used by the original smoke test.
-  vllm_max_num_seqs: 1
+  # Continuous batching keeps all four independent agent trajectories active.
+  vllm_max_num_seqs: 4
   vllm_enforce_eager: false
   vllm_gpu_memory_utilization: 0.9
   vllm_startup_timeout_seconds: 900

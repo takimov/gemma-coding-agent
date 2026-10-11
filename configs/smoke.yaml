@@ -37,7 +37,9 @@ rollout:
   # sandbox provides the supported isolated runner for this environment.
   sandbox: subprocess
   image: null
-  concurrency: 1
+  # Four independent SWEGemma sandboxes share one TP=4 vLLM server. Continuous
+  # batching overlaps decoding with tool/test execution from the other seeds.
+  concurrency: 4
   # The earlier 5-call smoke exhausted its budget before submit_patch and
   # produced only empty patches. Keep the real agent budget for a trainable group.
   max_tool_calls: 20
@@ -58,7 +60,7 @@ rollout:
   # independent from the smaller 8k training filter used by this smoke test.
   vllm_max_model_len: 32768
   # Native W4 has enough headroom for CUDA graphs on four L4 shards.
-  vllm_max_num_seqs: 1
+  vllm_max_num_seqs: 4
   vllm_enforce_eager: false
   vllm_gpu_memory_utilization: 0.9
   vllm_startup_timeout_seconds: 900

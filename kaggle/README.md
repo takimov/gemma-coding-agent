@@ -214,12 +214,16 @@ Rollout context остаётся 32768 независимо от `grpo.max_seq_l
 запрос, потому что prompt и зарезервированный completion вместе превысят 32768.
 Вывод managed vLLM одновременно показывается в stdout notebook и сохраняется в
 `<run>/vllm/collection_NNNN/vllm.log`.
-Native W4 использует `TP=4`, CUDA graphs и `max_num_seqs=1`. Это тот же быстрый
-inference-класс, на котором были собраны первые smoke rollout'ы с разными
-rewards. NF4/BitsAndBytes runtime shim в этой фазе намеренно не загружается.
-После появления reward variance loop делает короткий scoring pass по action
-tokens и сохраняет W4 raw-model `behavior_logprobs`; в stdout виден прогресс
-`[rollout] scoring W4 behavior logprobs N/4`.
+Native W4 использует `TP=4`, CUDA graphs и `max_num_seqs=4`. Четыре seed'а
+запускаются в независимых SWEGemma subprocess sandbox одновременно, а один
+vLLM непрерывно батчит их запросы. Один evaluator-процесс всё равно получает
+`--concurrency 1`, потому что в нём ровно одна задача; `rollout.concurrency`
+управляет параллелизмом seed'ов. Это тот же быстрый inference-класс, на котором
+были собраны первые smoke rollout'ы с разными rewards. NF4/BitsAndBytes runtime
+shim в этой фазе намеренно не загружается.
+После появления reward variance loop параллельно делает короткий scoring pass
+по action tokens и сохраняет W4 raw-model `behavior_logprobs`; в stdout виден
+прогресс `[rollout] scoring W4 behavior logprobs N/4`.
 Managed server передаёт Gemma 4 reasoning boundaries (`<|channel>` и
 `<channel|>`) через `--reasoning-config`, поэтому запросы SWEGemma с
 `thinking_token_budget` принимаются vLLM 0.19.1.

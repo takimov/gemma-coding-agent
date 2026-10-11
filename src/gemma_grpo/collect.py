@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -138,7 +140,13 @@ def collect_rollouts(
     for task in tasks:
         current_task_id = task_id(task)
         group_id = f"iter-{iteration:04d}:{current_task_id}"
-        for seed in config.rollout.seeds:
+
+        def collect_seed(seed: int) -> dict[str, Any]:
+            started = time.monotonic()
+            print(
+                f"[rollout] seed={seed} started; task={current_task_id}",
+                flush=True,
+            )
             run_dir = results_root / f"iter_{iteration:04d}" / _safe_name(current_task_id) / f"seed_{seed}"
             if run_dir.exists() and any(run_dir.iterdir()):
                 raise FileExistsError(
@@ -167,7 +175,9 @@ def collect_rollouts(
                         max_tool_calls=config.rollout.max_tool_calls,
                         max_time_minutes=config.rollout.max_time_minutes,
                         timeout_seconds=config.rollout.timeout_seconds,
-                        concurrency=config.rollout.concurrency,
+                        # This invocation contains exactly one task. Parallelism
+                        # across GRPO seeds is owned by the outer executor.
+                        concurrency=1,
                     )
                 )
 
@@ -221,7 +231,31 @@ def collect_rollouts(
                 "trace_path": str(trace_path) if trace_path else None,
                 "trace_error": trace_error or None,
             }
-            rows.append(row)
+            print(
+                f"[rollout] seed={seed} completed in "
+                f"{time.monotonic() - started:.1f}s; reward={reward}; "
+                f"reason={reward_reason}; returncode={completed.returncode}",
+                flush=True,
+            )
+            return row
+
+        worker_count = min(config.rollout.concurrency, len(config.rollout.seeds))
+        print(
+            f"[rollout] collecting {len(config.rollout.seeds)} seed(s) with "
+            f"concurrency={worker_count}",
+            flush=True,
+        )
+        if worker_count == 1:
+            task_rows = [collect_seed(seed) for seed in config.rollout.seeds]
+        else:
+            # executor.map preserves the configured seed order even though the
+            # independent sandboxes finish out of order.
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="gemma-rollout",
+            ) as executor:
+                task_rows = list(executor.map(collect_seed, config.rollout.seeds))
+        rows.extend(task_rows)
 
     normalized = add_group_advantages(rows)
     if (
@@ -239,6 +273,7 @@ def collect_rollouts(
             api_base=f"http://127.0.0.1:{config.rollout.vllm_port}/v1",
             model="main_lora" if adapter is not None else "gemma-4-31b-it-qat-w4a16-ct",
             trust_remote_code=config.model.trust_remote_code,
+            max_workers=config.rollout.concurrency,
         )
     for row in normalized:
         append_jsonl(output_path, row)
