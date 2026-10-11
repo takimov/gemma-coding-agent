@@ -218,6 +218,9 @@ cache не помещаются в 22 GiB L4. `gpu_memory_utilization=0.85` ос
 Managed server передаёт Gemma 4 reasoning boundaries (`<|channel>` и
 `<channel|>`) через `--reasoning-config`, поэтому запросы SWEGemma с
 `thinking_token_budget` принимаются vLLM 0.19.1.
+Runtime shim также удаляет отсутствующие optional Gemma 4 tensors перед
+pipeline-parallel transport: vLLM 0.19.1 иначе пытается срезать значение
+`None` как тензор на следующем PP rank.
 
 ## Ячейка 4 — обязательный smoke
 

@@ -107,7 +107,20 @@ def _patch_loader_class(loader_class: type) -> None:
 
 
 def _patch_intermediate_tensors_class(intermediate_class: type) -> None:
-    """Backport the mapping ``get`` operation used by Gemma4 PP in vLLM."""
+    """Backport safe optional-tensor handling used by newer Gemma4 PP."""
+    if not getattr(intermediate_class, "_gemma_grpo_optional_tensor_compat", False):
+        original_init = intermediate_class.__init__
+
+        def init(self: Any, tensors: dict[str, Any], *args: Any, **kwargs: Any) -> None:
+            # vLLM's PP transport slices every dictionary value as a tensor.
+            # Gemma4 0.19.1 includes optional PLE inputs even when their value
+            # is None, which crashes sync_and_slice_intermediate_tensors.
+            present = {key: value for key, value in tensors.items() if value is not None}
+            original_init(self, present, *args, **kwargs)
+
+        intermediate_class.__init__ = init
+        intermediate_class._gemma_grpo_optional_tensor_compat = True
+
     if hasattr(intermediate_class, "get"):
         return
 

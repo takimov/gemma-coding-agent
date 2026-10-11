@@ -90,15 +90,29 @@ def test_tied_kv_state_does_not_replace_real_v():
     assert states["model.layers.1.self_attn.v_proj.weight"] is v_state
 
 
-def test_intermediate_tensors_patch_adds_mapping_get():
+def test_intermediate_tensors_patch_adds_mapping_get_and_drops_none():
     class Intermediate:
         def __init__(self, tensors):
             self.tensors = tensors
 
     _patch_intermediate_tensors_class(Intermediate)
     value = object()
-    intermediate = Intermediate({"hidden_states": value})
+    intermediate = Intermediate({"hidden_states": value, "per_layer_inputs": None})
 
     assert intermediate.get("hidden_states") is value
+    assert "per_layer_inputs" not in intermediate.tensors
     assert intermediate.get("missing") is None
     assert intermediate.get("missing", "fallback") == "fallback"
+
+
+def test_intermediate_tensors_patch_is_idempotent():
+    class Intermediate:
+        def __init__(self, tensors):
+            self.tensors = tensors
+
+    _patch_intermediate_tensors_class(Intermediate)
+    patched_init = Intermediate.__init__
+    _patch_intermediate_tensors_class(Intermediate)
+
+    assert Intermediate.__init__ is patched_init
+    assert Intermediate({"optional": None}).tensors == {}
