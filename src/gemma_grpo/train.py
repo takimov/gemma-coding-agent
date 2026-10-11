@@ -256,7 +256,15 @@ def _load_model_and_tokenizer(
                 f"CPU/disk assignments include: {offloaded[:5]}"
             )
         print(f"[train] dispatching decompressed model with device map: {device_map}")
-        model = dispatch_model(model, device_map=device_map)
+        # Gemma applies tensor-valued logits_to_keep before lm_head.  CPU index
+        # tensors are valid for CUDA advanced indexing; prevent the root
+        # Accelerate hook from moving this kwarg to the main device (cuda:0),
+        # because the final hidden state may live on another GPU.
+        model = dispatch_model(
+            model,
+            device_map=device_map,
+            skip_keys=["logits_to_keep"],
+        )
     return model, tokenizer
 
 
@@ -264,25 +272,15 @@ def _embedding_device(model: Any):
     return model.get_input_embeddings().weight.device
 
 
-def _logit_selection_device(model: Any):
-    """Return the device holding hidden states immediately before ``lm_head``.
+def _cpu_logit_positions(action_positions: list[int]):
+    """Build CPU indices that remain valid for a model-parallel hidden state."""
+    import torch
 
-    Gemma applies tensor-valued ``logits_to_keep`` to the final hidden states
-    before calling ``lm_head``.  Under Accelerate model parallelism those hidden
-    states live with the language-model norm, not necessarily with embeddings
-    or the (tied) output head.
-    """
-    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
-    for owner in (model, base_model):
-        device_map = getattr(owner, "hf_device_map", None)
-        if device_map:
-            for name, device in device_map.items():
-                if name.endswith("language_model.norm"):
-                    return f"cuda:{device}" if isinstance(device, int) else device
-    for name, parameter in model.named_parameters():
-        if name.endswith("language_model.norm.weight"):
-            return parameter.device
-    return _embedding_device(model)
+    return torch.tensor(
+        [position - 1 for position in action_positions],
+        dtype=torch.long,
+        device="cpu",
+    )
 
 
 def _supports_selective_logits(model: Any) -> bool:
@@ -301,11 +299,7 @@ def _selected_logprobs(model: Any, tokenized: TokenizedTrajectory):
     kwargs: dict[str, Any] = {"input_ids": input_ids, "use_cache": False}
     base_signature = inspect.signature(model.get_base_model().forward)
     if "logits_to_keep" in base_signature.parameters:
-        logit_positions = torch.tensor(
-            [position - 1 for position in tokenized.action_positions],
-            dtype=torch.long,
-            device=_logit_selection_device(model),
-        )
+        logit_positions = _cpu_logit_positions(tokenized.action_positions)
         kwargs["logits_to_keep"] = logit_positions
     elif "num_logits_to_keep" in base_signature.parameters:
         # Older model implementations only support a suffix. It is correct only

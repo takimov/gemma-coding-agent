@@ -1,4 +1,4 @@
-from gemma_grpo.train import _logit_selection_device, _no_split_module_classes
+from gemma_grpo.train import _cpu_logit_positions, _no_split_module_classes
 
 
 class _BaseModel:
@@ -17,18 +17,7 @@ def test_no_split_module_classes_flattens_peft_collections():
     ]
 
 
-class _ParallelBaseModel:
-    hf_device_map = {
-        "model.language_model.embed_tokens": 0,
-        "model.language_model.norm": 3,
-        "lm_head": 0,
-    }
-
-
-class _ParallelWrapper:
-    def get_base_model(self):
-        return _ParallelBaseModel()
-
-
-def test_logit_selection_device_uses_final_language_norm():
-    assert _logit_selection_device(_ParallelWrapper()) == "cuda:3"
+def test_selective_logit_positions_stay_on_cpu():
+    positions = _cpu_logit_positions([1, 4, 9])
+    assert positions.tolist() == [0, 3, 8]
+    assert positions.device.type == "cpu"
