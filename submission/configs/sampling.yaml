@@ -1,16 +1,8 @@
-temperature: 0.8
+temperature: 0.2
 top_p: 0.95
 seed: 101
-# This is a per-turn reservation, not the trajectory context size.  Reserving
-# 16k on every tool turn makes vLLM reject a request as soon as the accumulated
-# prompt exceeds 16k (16k prompt + 16k requested completion > 32k context).
-# Reserve only 4k per turn.  SWEGemma sends the full accumulated tool history
-# on every request, and an 8k reservation makes vLLM reject the next turn as
-# soon as the prompt reaches 24577 tokens (24577 + 8192 > 32768).  Individual
-# coding-agent turns do not need 8k generated tokens; keeping 4k leaves almost
-# 29k for repository reads, command output, and the final submit_patch turn.
-max_output_tokens: 4096
+max_output_tokens: 8192
 thinking_config:
   include_thoughts: true
-  thinking_budget: 2048
+  thinking_budget: 4096
 

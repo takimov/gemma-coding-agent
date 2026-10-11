@@ -23,6 +23,15 @@ class RolloutConfig:
     max_tool_calls: int = 20
     max_time_minutes: int = 15
     timeout_seconds: int | None = None
+    max_turns: int | None = 80
+    evaluator_backend: str = "direct"
+    context_cache_min_tokens: int = 2048
+    context_cache_ttl_seconds: int = 1800
+    context_cache_intervals: int = 10
+    compaction_interval: int = 15
+    compaction_overlap_size: int = 2
+    compaction_token_threshold: int = 14336
+    compaction_event_retention_size: int = 5
     seeds: tuple[int, ...] = (101, 202, 303, 404)
     managed_vllm: bool = True
     # ``nf4`` uses the saved BitsAndBytes training checkpoint.  The faster
@@ -156,6 +165,30 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("rollout.sandbox must be 'docker' or 'subprocess'")
     if config.rollout.concurrency < 1:
         raise ValueError("rollout.concurrency must be positive")
+    if config.rollout.max_tool_calls < 1:
+        raise ValueError("rollout.max_tool_calls must be positive")
+    if config.rollout.max_time_minutes < 1:
+        raise ValueError("rollout.max_time_minutes must be positive")
+    if config.rollout.timeout_seconds is not None and config.rollout.timeout_seconds < 1:
+        raise ValueError("rollout.timeout_seconds must be positive when set")
+    if config.rollout.max_turns is not None and config.rollout.max_turns < 1:
+        raise ValueError("rollout.max_turns must be positive when set")
+    if config.rollout.evaluator_backend not in {"cli", "direct"}:
+        raise ValueError("rollout.evaluator_backend must be 'cli' or 'direct'")
+    if config.rollout.context_cache_min_tokens < 1:
+        raise ValueError("rollout.context_cache_min_tokens must be positive")
+    if config.rollout.context_cache_ttl_seconds < 1:
+        raise ValueError("rollout.context_cache_ttl_seconds must be positive")
+    if config.rollout.context_cache_intervals < 1:
+        raise ValueError("rollout.context_cache_intervals must be positive")
+    if config.rollout.compaction_interval < 1:
+        raise ValueError("rollout.compaction_interval must be positive")
+    if config.rollout.compaction_overlap_size < 0:
+        raise ValueError("rollout.compaction_overlap_size must be non-negative")
+    if config.rollout.compaction_token_threshold < 1:
+        raise ValueError("rollout.compaction_token_threshold must be positive")
+    if config.rollout.compaction_event_retention_size < 1:
+        raise ValueError("rollout.compaction_event_retention_size must be positive")
     if config.grpo.epochs < 1:
         raise ValueError("grpo.epochs must be at least 1")
     if config.grpo.max_steps is not None and config.grpo.max_steps < 1:

@@ -50,6 +50,8 @@ def _prepare_submission(
     adapter: Path | None,
     max_tool_calls: int,
     max_time_minutes: int,
+    timeout_seconds: int | None = None,
+    max_turns: int | None = None,
     model_alias: str = "gemma-4-31b-it-qat-w4a16-ct",
 ) -> None:
     shutil.copytree(source, destination)
@@ -63,6 +65,10 @@ def _prepare_submission(
     evaluation = eval_config.setdefault("evaluation", {})
     evaluation["max_tool_calls"] = max_tool_calls
     evaluation["max_time_minutes"] = max_time_minutes
+    if timeout_seconds is not None:
+        evaluation["timeout_seconds"] = timeout_seconds
+    if max_turns is not None:
+        evaluation["max_turns"] = max_turns
     eval_path.write_text(yaml.safe_dump(eval_config, sort_keys=False), encoding="utf-8")
 
     agent_path = destination / "agent.yaml"
@@ -184,6 +190,8 @@ def collect_rollouts(
                     adapter=adapter,
                     max_tool_calls=config.rollout.max_tool_calls,
                     max_time_minutes=config.rollout.max_time_minutes,
+                    timeout_seconds=config.rollout.timeout_seconds,
+                    max_turns=config.rollout.max_turns,
                     model_alias=config.rollout.vllm_served_model_name,
                 )
                 completed = run_eval(
@@ -199,9 +207,33 @@ def collect_rollouts(
                         max_tool_calls=config.rollout.max_tool_calls,
                         max_time_minutes=config.rollout.max_time_minutes,
                         timeout_seconds=config.rollout.timeout_seconds,
+                        max_turns=config.rollout.max_turns,
                         # This invocation contains exactly one task. Parallelism
                         # across GRPO seeds is owned by the outer executor.
                         concurrency=1,
+                        evaluator_backend=config.rollout.evaluator_backend,
+                        graph_dir=tasks_path.parent / "graphs",
+                        embeddings_dir=tasks_path.parent / "embeddings",
+                        wheels_dir=tasks_path.parent / "wheels",
+                        context_cache_min_tokens=(
+                            config.rollout.context_cache_min_tokens
+                        ),
+                        context_cache_ttl_seconds=(
+                            config.rollout.context_cache_ttl_seconds
+                        ),
+                        context_cache_intervals=(
+                            config.rollout.context_cache_intervals
+                        ),
+                        compaction_interval=config.rollout.compaction_interval,
+                        compaction_overlap_size=(
+                            config.rollout.compaction_overlap_size
+                        ),
+                        compaction_token_threshold=(
+                            config.rollout.compaction_token_threshold
+                        ),
+                        compaction_event_retention_size=(
+                            config.rollout.compaction_event_retention_size
+                        ),
                     )
                 )
 

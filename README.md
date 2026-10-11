@@ -85,10 +85,13 @@ task IDs и увеличьте `--target-steps`. `--resume` продолжает
 `loop_state.json`; rollout с одинаковыми rewards автоматически пересэмплируется.
 Внешний `--models-yaml` допустим только при `rollout.managed_vllm: false`.
 
-Основной агент снова Gemma 4 (`submission`). Smoke и production дают каждому
-seed до 50 tool calls и 15 минут. Collector отбрасывает траекторию только при
-явной структурированной ошибке исчерпания tool budget; упоминание лимита в
-system prompt не считается ошибкой.
+Основной агент снова Gemma 4 (`submission`). Smoke и production используют
+проверенный Budget-Fit режим: 28 tool calls, 8 минут, command timeout 240 секунд
+и не более 80 turns. Каждый seed запускает официальный прямой `Evaluator` с
+`ContextCacheConfig`, `EventsCompactionConfig`, competition graphs, embeddings
+и wheels. Collector отбрасывает траекторию только при явной структурированной
+ошибке исчерпания tool budget; упоминание лимита в system prompt не считается
+ошибкой.
 
 ## Offline SFT вместо online GRPO
 

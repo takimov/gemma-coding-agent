@@ -40,11 +40,19 @@ rollout:
   # Four independent SWEGemma sandboxes share one TP=4 vLLM server. Continuous
   # batching overlaps decoding with tool/test execution from the other seeds.
   concurrency: 4
-  # Match the production agent budget. Trajectories that actually exhaust it
-  # are rejected by the collector instead of becoming negative RL examples.
-  max_tool_calls: 50
-  max_time_minutes: 15
-  timeout_seconds: null
+  # Proven competition budget: longer call-bound runs risk the notebook wall.
+  max_tool_calls: 28
+  max_time_minutes: 8
+  timeout_seconds: 240
+  max_turns: 80
+  evaluator_backend: direct
+  context_cache_min_tokens: 2048
+  context_cache_ttl_seconds: 1800
+  context_cache_intervals: 10
+  compaction_interval: 15
+  compaction_overlap_size: 2
+  compaction_token_threshold: 14336
+  compaction_event_retention_size: 5
   seeds: [101, 202, 303, 404]
   managed_vllm: true
   # Roll out with the official inference-optimized QAT W4A16 checkpoint passed
@@ -57,7 +65,7 @@ rollout:
   # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
   vllm_language_model_only: true
   # Keep rollout context independent from the smaller 8k training filter used
-  # by this smoke test. Submission turns reserve 4k for generation.
+  # by this smoke test. Submission turns reserve 8k for generation.
   vllm_max_model_len: 32768
   # Native W4 has enough headroom for CUDA graphs on four L4 shards.
   vllm_max_num_seqs: 4

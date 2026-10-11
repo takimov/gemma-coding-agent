@@ -43,12 +43,20 @@ rollout:
   image: null
   # Collect the four GRPO samples concurrently against one batched vLLM.
   concurrency: 4
-  # Give Gemma the same agent budget used by the Qwen teacher. Exhausted
-  # trajectories are rejected rather than trained as ordinary failures.
-  max_tool_calls: 50
-  max_time_minutes: 15
-  # Kept in submission/eval_config.yaml; null avoids relying on a version-specific CLI flag.
-  timeout_seconds: null
+  # Budget-Fit v4 is the proven competition operating point. Direct evaluation
+  # additionally enables the official context cache and event compaction.
+  max_tool_calls: 28
+  max_time_minutes: 8
+  timeout_seconds: 240
+  max_turns: 80
+  evaluator_backend: direct
+  context_cache_min_tokens: 2048
+  context_cache_ttl_seconds: 1800
+  context_cache_intervals: 10
+  compaction_interval: 15
+  compaction_overlap_size: 2
+  compaction_token_threshold: 14336
+  compaction_event_retention_size: 5
   seeds: [101, 202, 303, 404]
   # The loop owns vLLM. Rollouts use the official QAT W4A16 checkpoint supplied
   # via --rollout-model-path; training remains on the persistent NF4 checkpoint.
@@ -59,8 +67,8 @@ rollout:
   vllm_pipeline_parallel_size: 1
   # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
   vllm_language_model_only: true
-  # Gemma 4's full context; submission sampling reserves up to 4k per turn so
-  # the accumulated tool history can grow to almost 29k without rejection.
+  # Gemma 4's full context. Budget-Fit keeps tool output and call count bounded
+  # so the 8k completion reservation still leaves 24k for accumulated history.
   vllm_max_model_len: 32768
   # Continuous batching keeps all four independent agent trajectories active.
   vllm_max_num_seqs: 4

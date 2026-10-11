@@ -59,13 +59,18 @@ def test_qwen_teacher_config_discards_cross_tokenizer_ids():
     assert config.rollout.vllm_max_model_len == 32768
 
 
-def test_gemma_rollouts_use_full_agent_budget():
+def test_gemma_rollouts_use_budget_fit_direct_evaluator():
     root = Path(__file__).parents[1]
 
     for name in ("smoke.yaml", "grpo.yaml"):
         config = load_config(root / "configs" / name)
-        assert config.rollout.max_tool_calls == 50
-        assert config.rollout.max_time_minutes == 15
+        assert config.rollout.max_tool_calls == 28
+        assert config.rollout.max_time_minutes == 8
+        assert config.rollout.timeout_seconds == 240
+        assert config.rollout.max_turns == 80
+        assert config.rollout.evaluator_backend == "direct"
+        assert config.rollout.context_cache_min_tokens == 2048
+        assert config.rollout.compaction_token_threshold == 14336
 
 
 def test_mismatched_group_size_is_rejected(tmp_path):

@@ -32,6 +32,8 @@ def test_prepared_submission_updates_seed_budget_and_adapter(tmp_path):
         adapter=adapter,
         max_tool_calls=5,
         max_time_minutes=3,
+        timeout_seconds=120,
+        max_turns=40,
     )
 
     sampling = yaml.safe_load((destination / "configs" / "sampling.yaml").read_text())
@@ -39,6 +41,8 @@ def test_prepared_submission_updates_seed_budget_and_adapter(tmp_path):
     assert sampling["seed"] == 202
     assert evaluation["max_tool_calls"] == 5
     assert evaluation["max_time_minutes"] == 3
+    assert evaluation["timeout_seconds"] == 120
+    assert evaluation["max_turns"] == 40
     assert "adapter: main_lora" in (destination / "agent.yaml").read_text()
     adapter_files = {path.name for path in (destination / "adapters" / "main_lora").iterdir()}
     assert adapter_files == {"adapter_config.json", "adapter_model.safetensors"}
@@ -90,6 +94,11 @@ def test_collect_rollouts_runs_group_seeds_concurrently_and_preserves_order(
         sampling = yaml.safe_load(
             (invocation.submission_dir / "configs" / "sampling.yaml").read_text()
         )
+        assert invocation.evaluator_backend == "direct"
+        assert invocation.graph_dir == tasks.parent / "graphs"
+        assert invocation.embeddings_dir == tasks.parent / "embeddings"
+        assert invocation.wheels_dir == tasks.parent / "wheels"
+        assert invocation.compaction_token_threshold == 14336
         barrier.wait(timeout=5)
         invocation.results_dir.mkdir(parents=True, exist_ok=True)
         (invocation.results_dir / "task_results.jsonl").write_text(

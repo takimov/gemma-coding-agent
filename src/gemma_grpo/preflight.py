@@ -150,6 +150,15 @@ def run_preflight(
                 not unknown_tools,
                 "ok" if not unknown_tools else f"not in SWEGemma registry: {unknown_tools}",
             )
+            prompt = (submission_dir / "prompts" / "system.md").read_text(
+                encoding="utf-8"
+            )
+            template_safe = "{" not in prompt and "}" not in prompt
+            record(
+                "submission prompt template safety",
+                template_safe,
+                "no ADK template braces" if template_safe else "prompt contains { or }",
+            )
             max_output_tokens = (
                 sampling.get("max_output_tokens") if isinstance(sampling, dict) else None
             )
@@ -166,6 +175,20 @@ def run_preflight(
                     f"max_output_tokens={max_output_tokens}; "
                     f"required <= {max_safe_output} for "
                     f"vLLM context {config.rollout.vllm_max_model_len}"
+                ),
+            )
+            compaction_headroom_ok = (
+                output_budget_ok
+                and config.rollout.compaction_token_threshold + max_output_tokens
+                <= config.rollout.vllm_max_model_len
+            )
+            record(
+                "direct evaluator compaction headroom",
+                compaction_headroom_ok,
+                (
+                    f"threshold={config.rollout.compaction_token_threshold}, "
+                    f"max_output_tokens={max_output_tokens}, "
+                    f"context={config.rollout.vllm_max_model_len}"
                 ),
             )
             eval_config = yaml.safe_load(
@@ -188,6 +211,17 @@ def run_preflight(
             record("tasks.jsonl", False, str(error))
     if snapshots_dir is not None:
         record("snapshots directory", snapshots_dir.is_dir(), str(snapshots_dir))
+    if config.rollout.evaluator_backend == "direct" and tasks_path is not None:
+        data_root = tasks_path.parent
+        for name in ("graphs", "embeddings", "wheels"):
+            resource = data_root / name
+            record(f"competition {name}", resource.is_dir(), str(resource))
+
+    record(
+        "rollout evaluator backend",
+        config.rollout.evaluator_backend in {"cli", "direct"},
+        config.rollout.evaluator_backend,
+    )
 
     record("LoRA rank", 0 < config.lora.r <= 128, f"r={config.lora.r}; competition maximum is 128")
     record(
