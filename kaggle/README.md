@@ -215,6 +215,9 @@ Rollout context остаётся 32768 независимо от `grpo.max_seq_l
 `max_num_seqs=1`: это исключает CUDA-graph pools, которые после выделения KV
 cache не помещаются в 22 GiB L4. `gpu_memory_utilization=0.85` оставляет запас
 для временных BitsAndBytes buffers.
+Managed server передаёт Gemma 4 reasoning boundaries (`<|channel>` и
+`<channel|>`) через `--reasoning-config`, поэтому запросы SWEGemma с
+`thinking_token_budget` принимаются vLLM 0.19.1.
 
 ## Ячейка 4 — обязательный smoke
 

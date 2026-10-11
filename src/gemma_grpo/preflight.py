@@ -259,6 +259,8 @@ def run_preflight(
             "--served-model-name",
             "--quantization",
             "--load-format",
+            "--reasoning-parser",
+            "--reasoning-config",
             "--enable-lora",
             "--lora-modules",
             "--max-lora-rank",

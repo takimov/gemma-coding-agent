@@ -22,6 +22,10 @@ from .nf4 import assert_nf4_checkpoint
 BASE_MODEL_ALIAS = "gemma-4-31b-it-qat-w4a16-ct"
 ADAPTER_ALIAS = "main_lora"
 VLLM_COMPAT_SITE = Path(__file__).with_name("_vllm_site")
+GEMMA4_REASONING_CONFIG = {
+    "reasoning_start_str": "<|channel>",
+    "reasoning_end_str": "<channel|>",
+}
 
 
 def _tee_stream(source: TextIO, *destinations: TextIO) -> None:
@@ -136,6 +140,7 @@ class ManagedVllmServer:
         add("--load-format", "bitsandbytes")
         add("--tool-call-parser", "gemma4")
         add("--reasoning-parser", "gemma4")
+        add("--reasoning-config", json.dumps(GEMMA4_REASONING_CONFIG))
         add("--enable-auto-tool-choice")
         add("--disable-log-requests")
         if rollout.vllm_enforce_eager:

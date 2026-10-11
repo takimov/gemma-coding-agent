@@ -1,3 +1,4 @@
+import json
 from io import StringIO
 
 import yaml
@@ -6,6 +7,7 @@ from gemma_grpo.config import load_config
 from gemma_grpo.vllm_server import (
     ADAPTER_ALIAS,
     BASE_MODEL_ALIAS,
+    GEMMA4_REASONING_CONFIG,
     ManagedVllmServer,
     VLLM_COMPAT_SITE,
     _tee_stream,
@@ -47,7 +49,8 @@ def test_managed_vllm_uses_pipeline_parallel_for_prequantized_nf4(tmp_path, monk
         "_supported_flags",
         lambda: (
             "--quantization --load-format --pipeline-parallel-size "
-            "--language-model-only --max-num-seqs --enforce-eager"
+            "--language-model-only --max-num-seqs --enforce-eager "
+            "--reasoning-parser --reasoning-config"
         ),
     )
 
@@ -59,6 +62,10 @@ def test_managed_vllm_uses_pipeline_parallel_for_prequantized_nf4(tmp_path, monk
     assert command[command.index("--max-num-seqs") + 1] == "1"
     assert "--enforce-eager" in command
     assert "--language-model-only" in command
+    assert command[command.index("--reasoning-parser") + 1] == "gemma4"
+    assert json.loads(command[command.index("--reasoning-config") + 1]) == (
+        GEMMA4_REASONING_CONFIG
+    )
 
 
 def test_vllm_environment_installs_compat_for_spawned_workers(monkeypatch):
