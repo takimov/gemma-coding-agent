@@ -216,7 +216,7 @@ Native W4 использует `TP=4`, CUDA graphs и `max_num_seqs=1`. Это �
 inference-класс, на котором были собраны первые smoke rollout'ы с разными
 rewards. NF4/BitsAndBytes runtime shim в этой фазе намеренно не загружается.
 После появления reward variance loop делает короткий scoring pass по action
-tokens и сохраняет точные W4 `behavior_logprobs`; в stdout виден прогресс
+tokens и сохраняет W4 raw-model `behavior_logprobs`; в stdout виден прогресс
 `[rollout] scoring W4 behavior logprobs N/4`.
 Managed server передаёт Gemma 4 reasoning boundaries (`<|channel>` и
 `<channel|>`) через `--reasoning-config`, поэтому запросы SWEGemma с
@@ -338,6 +338,6 @@ print(submission_zip, round(submission_zip.stat().st_size / 2**20, 1), "MiB")
 ```
 
 Перед submission отдельно проверьте adapter с официальным W4 base. Rollout и
-competition evaluator используют W4, training — NF4; exact W4 behavior
+competition evaluator используют W4, training — NF4; сохранённые W4 raw-model
 log-probabilities корректируют это различие в clipped ratio, но logits двух base
 formats всё равно не bit-exact.

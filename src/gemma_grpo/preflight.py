@@ -271,6 +271,7 @@ def run_preflight(
             "--served-model-name",
             "--reasoning-parser",
             "--reasoning-config",
+            "--logprobs-mode",
             "--enable-lora",
             "--lora-modules",
             "--max-lora-rank",

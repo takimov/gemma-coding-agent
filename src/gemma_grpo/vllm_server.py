@@ -164,6 +164,7 @@ class ManagedVllmServer:
         add("--tool-call-parser", "gemma4")
         add("--reasoning-parser", "gemma4")
         add("--reasoning-config", json.dumps(GEMMA4_REASONING_CONFIG))
+        add("--logprobs-mode", "raw_logprobs")
         add("--enable-auto-tool-choice")
         add("--disable-log-requests")
         if rollout.vllm_enforce_eager:

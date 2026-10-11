@@ -58,8 +58,8 @@ rank считает loss своей trajectory. FSDP усредняет gradient
 несколько trajectories, local loss сначала усредняется локально. Metrics затем
 суммируются через `accelerator.reduce`.
 
-Для каждой trainable W4 trajectory до остановки vLLM сохраняются точные
-behavior log-probabilities наблюдённых action tokens. До первого optimizer step
+Для каждой trainable W4 trajectory до остановки vLLM сохраняются raw-model
+log-probabilities наблюдённых action tokens. До первого optimizer step
 также фиксируются:
 
 - reference log-probabilities того же NF4 base с отключённым adapter.

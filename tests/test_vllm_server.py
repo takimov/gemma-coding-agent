@@ -52,7 +52,7 @@ def test_managed_vllm_uses_tensor_parallel_for_native_w4(tmp_path, monkeypatch):
         lambda: (
             "--quantization --load-format --pipeline-parallel-size "
             "--language-model-only --max-num-seqs --enforce-eager "
-            "--reasoning-parser --reasoning-config"
+            "--reasoning-parser --reasoning-config --logprobs-mode"
         ),
     )
 
@@ -70,6 +70,7 @@ def test_managed_vllm_uses_tensor_parallel_for_native_w4(tmp_path, monkeypatch):
     assert json.loads(command[command.index("--reasoning-config") + 1]) == (
         GEMMA4_REASONING_CONFIG
     )
+    assert command[command.index("--logprobs-mode") + 1] == "raw_logprobs"
 
 
 def test_vllm_environment_installs_compat_for_spawned_workers(monkeypatch):

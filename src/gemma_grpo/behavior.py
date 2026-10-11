@@ -106,7 +106,7 @@ def attach_behavior_logprobs(
     trust_remote_code: bool,
     timeout_seconds: int = 300,
 ) -> list[dict[str, Any]]:
-    """Record exact W4 behavior probabilities for trainable action tokens.
+    """Record W4 raw-model probabilities for trainable action tokens.
 
     The completion endpoint receives the already-tokenized trajectory with
     ``add_special_tokens=False``. ``prompt_logprobs=0`` asks vLLM for only the
@@ -141,6 +141,6 @@ def attach_behavior_logprobs(
                 )
             )
         row["behavior_logprobs"] = values
-        row["behavior_logprob_source"] = "vllm_prompt_logprobs"
+        row["behavior_logprob_source"] = "vllm_raw_prompt_logprobs"
         row["behavior_trajectory_id"] = trajectory_fingerprint(segments)
     return rows

@@ -88,8 +88,8 @@ task IDs и увеличьте `--target-steps`. `--resume` продолжает
 
 Для каждой задачи собираются четыре траектории. Reward официального SWEGemma
 нормализуется внутри группы. Для native W4 rollout vLLM отдельно записывает
-точные log-probabilities наблюдённых action tokens через `prompt_logprobs=0`.
-Trainer использует их в clipped importance ratio, а frozen-reference
+W4 raw-model log-probabilities наблюдённых action tokens через
+`prompt_logprobs=0`. Trainer использует их в clipped importance ratio, а frozen-reference
 log-probabilities считает на NF4 base. Loss считается только на
 assistant/action токенах.
 
