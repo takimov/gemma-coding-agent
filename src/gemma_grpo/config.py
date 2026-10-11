@@ -28,6 +28,7 @@ class RolloutConfig:
     vllm_port: int = 8000
     vllm_tensor_parallel_size: int = 1
     vllm_pipeline_parallel_size: int = 4
+    vllm_language_model_only: bool = True
     vllm_gpu_memory_utilization: float = 0.9
     vllm_startup_timeout_seconds: int = 900
 

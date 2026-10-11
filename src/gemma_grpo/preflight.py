@@ -262,6 +262,8 @@ def run_preflight(
             "--max-lora-rank",
             "--max-loras",
         ]
+        if config.rollout.vllm_language_model_only:
+            required_flags.append("--language-model-only")
         missing = [flag for flag in required_flags if flag not in completed.stdout]
         record(
             "managed vLLM NF4/LoRA flags",

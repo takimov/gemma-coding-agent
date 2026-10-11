@@ -10,7 +10,8 @@ Rollout и обучение используют один постоянный b
 
 1. managed vLLM потоково читает тот же NF4 checkpoint, lossless bitcast'ит
    packed BF16 containers в uint8 views и собирает четыре SWEGemma rollout'а
-   pipeline-parallel на четырёх GPU;
+   pipeline-parallel на четырёх GPU; `--language-model-only` не создаёт
+   неиспользуемый vision tower для текстовых coding tasks;
 2. vLLM полностью останавливается и освобождает VRAM;
 3. четыре train-процесса загружают BF16-storage NF4 checkpoint, FSDP `FULL_SHARD`
    распределяет параметры/градиенты/optimizer state, а QLoRA обновляет adapter;

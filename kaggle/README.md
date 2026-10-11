@@ -204,6 +204,8 @@ subprocess.run(
 
 Preflight должен подтвердить BNB ≥0.48.1, общий BF16-storage NF4 checkpoint,
 runtime bitcast shim, встроенный BNB loader и четыре CUDA device.
+Managed server также включает `--language-model-only`: SWEGemma coding tasks не
+содержат изображений, а vision tower этого checkpoint не нужен для rollout.
 
 ## Ячейка 4 — обязательный smoke
 

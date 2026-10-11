@@ -29,6 +29,8 @@ def vllm_environment() -> dict[str, str]:
     environment.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     environment["VLLM_PLUGINS"] = ""
     environment["GEMMA_GRPO_VLLM_BNB_COMPAT"] = "1"
+    environment["VLLM_NO_USAGE_STATS"] = "1"
+    environment["DO_NOT_TRACK"] = "1"
     existing = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = str(VLLM_COMPAT_SITE) + (
         os.pathsep + existing if existing else ""
@@ -124,6 +126,8 @@ class ManagedVllmServer:
         add("--reasoning-parser", "gemma4")
         add("--enable-auto-tool-choice")
         add("--disable-log-requests")
+        if rollout.vllm_language_model_only:
+            add("--language-model-only")
         if "--default-chat-template-kwargs" in flags:
             command.extend(
                 ["--default-chat-template-kwargs", json.dumps({"enable_thinking": True})]

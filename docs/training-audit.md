@@ -28,6 +28,7 @@ saved BF16-storage NF4 base
 | P0 | Rollout был W4, training NF4 | Managed vLLM читает те же NF4-байты через streaming uint8 view без requantization |
 | P0 | Внешний BNB plugin новее vLLM 0.19.1 | Используется встроенный loader 0.19.1, внешний plugin отключён через `VLLM_PLUGINS=""` |
 | P0 | vLLM 0.19 не поддерживает pre-quantized BNB при TP>1 | Rollout использует PP=4 и сохраняет quantized tensors целыми |
+| P0 | vLLM создавал dense vision layers, но checkpoint хранил их в NF4 | Для текстовых SWEGemma задач включён `--language-model-only`; vision tower не создаётся |
 | P0 | Полный FP32 `action_tokens × 262144` tensor давал OOM 6.42 GiB | Selective hidden states и chunked lm_head/log-softmax |
 | P0 | Разное число ATIF segments на ranks нарушает порядок FSDP collectives | Tiny zero-loss padding forwards участвуют и в backward graph |
 | P1 | Checkpointed lm_head мог обратиться к уже reshared weight | Frozen tied embedding/lm_head реплицирован BF16 и исключён из FSDP |

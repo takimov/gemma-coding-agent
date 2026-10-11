@@ -53,6 +53,8 @@ rollout:
   # Pre-quantized BNB uses pipeline rather than tensor parallelism in vLLM 0.19.
   vllm_tensor_parallel_size: 1
   vllm_pipeline_parallel_size: 4
+  # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
+  vllm_language_model_only: true
   vllm_gpu_memory_utilization: 0.9
   vllm_startup_timeout_seconds: 900
 

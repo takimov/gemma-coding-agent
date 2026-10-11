@@ -17,6 +17,7 @@ def test_default_config_has_matching_group_and_seeds():
     assert config.rollout.managed_vllm is True
     assert config.rollout.vllm_tensor_parallel_size == 1
     assert config.rollout.vllm_pipeline_parallel_size == 4
+    assert config.rollout.vllm_language_model_only is True
     assert config.grpo.logprob_chunk_size == 32
     assert config.grpo.monitor_interval_seconds == 5
 

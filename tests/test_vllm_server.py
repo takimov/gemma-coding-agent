@@ -31,13 +31,17 @@ def test_managed_vllm_uses_pipeline_parallel_for_prequantized_nf4(tmp_path, monk
     monkeypatch.setattr(
         server,
         "_supported_flags",
-        lambda: "--quantization --load-format --pipeline-parallel-size",
+        lambda: (
+            "--quantization --load-format --pipeline-parallel-size "
+            "--language-model-only"
+        ),
     )
 
     command = server._command()
 
     assert command[command.index("--tensor-parallel-size") + 1] == "1"
     assert command[command.index("--pipeline-parallel-size") + 1] == "4"
+    assert "--language-model-only" in command
 
 
 def test_vllm_environment_installs_compat_for_spawned_workers(monkeypatch):
@@ -47,6 +51,8 @@ def test_vllm_environment_installs_compat_for_spawned_workers(monkeypatch):
 
     assert environment["VLLM_PLUGINS"] == ""
     assert environment["GEMMA_GRPO_VLLM_BNB_COMPAT"] == "1"
+    assert environment["VLLM_NO_USAGE_STATS"] == "1"
+    assert environment["DO_NOT_TRACK"] == "1"
     assert environment["PYTHONPATH"].split(":") == [
         str(VLLM_COMPAT_SITE),
         "/existing",
