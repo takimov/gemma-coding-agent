@@ -9,8 +9,10 @@ from .config import load_config
 from .export import export_submission
 from .loop import run_training_loop
 from .monitoring import summarize_telemetry
+from .nf4 import convert_to_nf4_checkpoint
 from .preflight import run_preflight
 from .train import train_adapter
+from .vllm_server import rollout_models_yaml
 
 
 def _paths(values: list[str]) -> list[Path]:
@@ -40,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--task-id", action="append", dest="task_ids")
     collect.add_argument("--adapter")
     collect.add_argument("--models-yaml")
+    collect.add_argument("--model-path")
+
+    convert_nf4 = subparsers.add_parser(
+        "convert-nf4",
+        help="convert the competition W4 checkpoint once into reusable FSDP/vLLM NF4",
+    )
+    convert_nf4.add_argument("--source-model", required=True)
+    convert_nf4.add_argument("--output-dir", required=True)
+    convert_nf4.add_argument("--trust-remote-code", action="store_true")
+    convert_nf4.add_argument("--max-shard-size", default="4GB")
 
     train = subparsers.add_parser("train", help="perform one on-policy artifact GRPO update")
     train.add_argument("--config", default="configs/grpo.yaml")
@@ -88,18 +100,30 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report["ok"] else 1
     if args.command == "collect":
-        rows = collect_rollouts(
-            config=load_config(args.config),
-            tasks_path=Path(args.tasks).resolve(),
-            snapshots_dir=Path(args.snapshots_dir).resolve(),
-            submission_dir=Path(args.submission_dir).resolve(),
-            results_root=Path(args.results_root).resolve(),
-            output_path=Path(args.output).resolve(),
-            iteration=args.iteration,
-            selected_ids=set(args.task_ids) if args.task_ids else None,
-            adapter=Path(args.adapter).resolve() if args.adapter else None,
-            models_yaml=Path(args.models_yaml).resolve() if args.models_yaml else None,
-        )
+        config = load_config(args.config)
+        results_root = Path(args.results_root).resolve()
+        adapter = Path(args.adapter).resolve() if args.adapter else None
+        model_path = args.model_path or config.model.name_or_path
+        external_models_yaml = Path(args.models_yaml).resolve() if args.models_yaml else None
+        with rollout_models_yaml(
+            config=config,
+            model_path=model_path,
+            adapter=adapter,
+            work_dir=results_root / "_vllm" / f"iter_{args.iteration:04d}",
+            external_models_yaml=external_models_yaml,
+        ) as models_yaml:
+            rows = collect_rollouts(
+                config=config,
+                tasks_path=Path(args.tasks).resolve(),
+                snapshots_dir=Path(args.snapshots_dir).resolve(),
+                submission_dir=Path(args.submission_dir).resolve(),
+                results_root=results_root,
+                output_path=Path(args.output).resolve(),
+                iteration=args.iteration,
+                selected_ids=set(args.task_ids) if args.task_ids else None,
+                adapter=adapter,
+                models_yaml=models_yaml,
+            )
         summary = {
             "rollouts": len(rows),
             "scorable": sum(bool(row["scorable"]) for row in rows),
@@ -107,6 +131,15 @@ def main(argv: list[str] | None = None) -> int:
             "trainable": sum(bool(row["trainable"]) for row in rows),
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "convert-nf4":
+        created = convert_to_nf4_checkpoint(
+            source_model=Path(args.source_model),
+            output_dir=Path(args.output_dir),
+            trust_remote_code=args.trust_remote_code,
+            max_shard_size=args.max_shard_size,
+        )
+        print(created)
         return 0
     if args.command == "train":
         summary = train_adapter(

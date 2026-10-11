@@ -1,286 +1,125 @@
-# SWEGemma GRPO loop
+# SWEGemma GRPO: FSDP + QLoRA
 
-Практический каркас для обучения LoRA-адаптера агента в соревновании
-**Gemma 4 Developer Agent**. Он использует официальный `swegemma` как источник
-rollout'ов и финального reward, а затем делает одну on-policy GRPO-итерацию по
-assistant/action-токенам.
+Экспериментальный on-policy GRPO-loop для соревнования Gemma 4 Developer Agent.
+Rollout и обучение используют один постоянный bitsandbytes NF4 checkpoint;
+31B-модель больше не распаковывается и не переквантуется перед каждым update.
 
-## Что именно реализовано
+## Архитектура
 
-Цикл устроен так:
+Один процесс автоматически чередует две взаимоисключающие фазы на 4×L4:
 
-1. Для каждой задачи `swegemma eval` запускается четыре раза с разными seed.
-2. Из `task_results.jsonl`, patch и ATIF trace собирается единый JSONL.
-   В него записывается SHA-256 fingerprint policy-адаптера.
-   Если ATIF содержит `prompt_token_ids`/`completion_token_ids`, trainer использует
-   точные per-call токены; иначе явно помечает fallback на реконструкцию chat template.
-3. Reward берётся из результата официальной pytest-верификации:
-   `1` за resolved, `0` за валидный, но не прошедший patch, `-0.25` за пустой
-   patch. Небольшой штраф за tool calls применяется только к успешным решениям.
-4. Reward нормализуется внутри группы одной задачи.
-5. Перед обновлением пересчитываются log-probabilities текущей policy и frozen
-   base model для всего batch до первого optimizer step. Затем выполняются
-   clipped GRPO updates LoRA-параметров относительно этой snapshot-policy.
-6. Обновлённый адаптер снова кладётся в submission; harness сам подключает его
-   к своему vLLM, и цикл повторяется на свежих rollout'ах.
+1. managed vLLM загружает NF4 checkpoint tensor-parallel на четыре GPU и
+   собирает четыре SWEGemma rollout'а;
+2. vLLM полностью останавливается и освобождает VRAM;
+3. четыре train-процесса загружают тот же NF4 checkpoint, FSDP `FULL_SHARD`
+   распределяет параметры/градиенты/optimizer state, а QLoRA обновляет adapter;
+4. adapter сохраняется, vLLM запускается с ним, и цикл повторяется.
 
-Это намеренно не маскируется под готовый `TRL GRPOTrainer`: официальный harness
-сам владеет двухконтейнерным agent loop, а его trace не содержит пригодных для
-PPO старых token log-probabilities. Здесь они честно пересчитываются и
-замораживаются для всего rollout-batch до первого шага оптимизатора. Несколько
-`grpo.epochs` внутри одного запуска допустимы; после завершения запуска нужны
-свежие rollout'ы.
+NF4 относится к большим Linear-весам. Frozen embedding/lm_head и служебные
+тензоры остаются BF16 — это стандартное и необходимое исключение FSDP-QLoRA.
+`bnb_4bit_quant_storage=bfloat16` не распаковывает веса: четыре 4-битных значения
+упакованы в один BF16 storage element, который FSDP умеет шардировать.
 
-## Структура
+Смена фаз всё ещё перечитывает веса с диска: vLLM и backward 31B не помещаются
+одновременно на тех же L4. Но преобразования W4 → BF16 → NF4 в цикле больше нет.
 
-- `submission/` — минимальный declarative agent для `adk-submission`.
-- `configs/grpo.yaml` — LoRA r=16/alpha=32, group size 4, beta 0.01 и лимиты.
-- `gemma-grpo collect` — канонические rollout'ы через `swegemma`.
-- `gemma-grpo train` — artifact-based GRPO update.
-- `gemma-grpo telemetry` — сводка CPU/RAM/GPU по фазам прошедшего train.
-- `gemma-grpo export` — ZIP с агентом и адаптером для Kaggle.
-- `gemma-grpo preflight` — проверки wheelhouse, данных, rank и chat template.
-- `gemma-grpo loop` — непрерывно чередует свежие rollout'ы и GRPO до заданного
-  числа optimizer steps.
+## Команды
 
-## 1. Установка
+- `gemma-grpo convert-nf4` — одноразово создаёт постоянный NF4 checkpoint;
+- `gemma-grpo preflight` — проверяет checkpoint, 4 GPU, версии и vLLM BNB plugin;
+- `gemma-grpo collect` — запускает managed NF4 vLLM и собирает rollout-группу;
+- `gemma-grpo train` — один FSDP-QLoRA GRPO update;
+- `gemma-grpo loop` — непрерывно чередует collect/train до целевого числа steps;
+- `gemma-grpo telemetry` — агрегирует GPU/CPU/RAM telemetry;
+- `gemma-grpo export` — собирает submission ZIP с LoRA adapter.
 
-Локально для разработки:
+## Одноразовая конвертация
+
+Competition checkpoint — `compressed-tensors` QAT W4. Его нужно преобразовать
+ровно один раз, до smoke test:
+
+```bash
+gemma-grpo convert-nf4 \
+  --source-model /path/to/gemma-4-31b-it-qat-w4a16-ct \
+  --output-dir /path/to/gemma-4-31b-nf4
+```
+
+Конвертер распаковывает source на CPU, последовательно квантует Linear-слои на
+одной scratch GPU и сохраняет обычный pre-quantized bitsandbytes checkpoint.
+Повторный вызов не перезаписывает существующую папку. Для следующих Kaggle
+сессий NF4 directory надо сохранить как notebook output/dataset; иначе дорогую
+одноразовую операцию придётся повторить после очистки `/kaggle/working`.
+
+## Smoke и непрерывное обучение
+
+```bash
+gemma-grpo preflight \
+  --config configs/smoke.yaml \
+  --tasks /path/to/tasks.jsonl \
+  --snapshots-dir /path/to/snapshots \
+  --submission-dir submission \
+  --model-path /path/to/gemma-4-31b-nf4
+
+gemma-grpo loop \
+  --config configs/smoke.yaml \
+  --tasks /path/to/tasks.jsonl \
+  --snapshots-dir /path/to/snapshots \
+  --submission-dir submission \
+  --model-path /path/to/gemma-4-31b-nf4 \
+  --task-id ACTUAL_TASK_ID \
+  --work-dir runs/smoke-fsdp \
+  --target-steps 1 \
+  --max-collections 5
+```
+
+После успешного smoke замените config на `configs/grpo.yaml`, добавьте несколько
+task IDs и увеличьте `--target-steps`. `--resume` продолжает атомарно сохранённый
+`loop_state.json`; rollout с одинаковыми rewards автоматически пересэмплируется.
+Внешний `--models-yaml` допустим только при `rollout.managed_vllm: false`.
+
+## Что считается в GRPO
+
+Для каждой задачи собираются четыре траектории. Reward официального SWEGemma
+нормализуется внутри группы. Старые policy log-probabilities и frozen-reference
+log-probabilities фиксируются до первого optimizer step. Loss считается только
+на assistant/action токенах, с clipped ratio и KL penalty.
+
+Если ATIF trace содержит token IDs каждого assistant call, используются они;
+иначе JSONL явно помечается `chat_template_reconstruction`. Разное число
+assistant calls между FSDP ranks выравнивается короткими zero-loss forwards —
+без этого порядок FSDP collectives мог бы зависнуть.
+
+Полный `action_tokens × vocabulary` tensor не создаётся. Hidden states сначала
+выбираются по action positions, а tied `lm_head + log_softmax` считается
+chunk'ами. Frozen tied embedding/lm_head реплицирован на каждом rank: это около
+2.8 GiB BF16 на GPU, зато checkpoint recompute не обращается к уже reshared
+FSDP-параметру.
+
+## Установка
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --no-build-isolation -e '.[dev,train]'
-pytest
+PYTHONPATH=src pytest -q
 ```
 
-В Kaggle интернет выключен, поэтому harness ставится из wheelhouse, который
-лежит в competition dataset. Точный mount меняется между версиями; сначала
-найдите его:
+В Kaggle vLLM 0.19+ требует отдельный `vllm-bnb-plugin`. Publisher кладёт
+зафиксированный официальный plugin wheel в private source dataset, потому что
+Internet с L4×4 выключен. Без этого wheel preflight завершится до загрузки 31B.
 
-```bash
-find /kaggle/input -type f \( -name 'swegemma*.whl' -o -name 'adk_submission*.whl' \)
-```
+Подробные готовые notebook cells находятся в
+[`kaggle/README.md`](kaggle/README.md), а допущения и остаточные риски — в
+[`docs/training-audit.md`](docs/training-audit.md).
 
-Затем:
+## Важные ограничения
 
-```bash
-pip install --no-index --find-links=/kaggle/input/COMPETITION_DATA/wheels \
-  swegemma adk-submission adk-eval-core
-pip install --no-build-isolation -e '.[train]'
-```
-
-Для воспроизводимости сохраняйте вывод `pip freeze` рядом с экспериментом.
-В опубликованном starter-наборе встречались `swegemma 0.2.7`,
-`adk-submission 0.2.11` и `adk-eval-core 0.1.0`, но preflight проверяет
-фактически установленную версию, а не полагается на эти номера.
-
-## 2. Preflight
-
-```bash
-gemma-grpo preflight \
-  --config configs/grpo.yaml \
-  --tasks /kaggle/input/COMPETITION_DATA/tasks.jsonl \
-  --snapshots-dir /kaggle/input/COMPETITION_DATA/snapshots \
-  --model-path /kaggle/input/ACTUAL_MODEL_DIRECTORY
-```
-
-Особенно важна проверка `chat template prefix preservation`. Если она падает,
-нельзя продолжать обучение: маска assistant-токенов будет неверной. Путь модели
-в `configs/grpo.yaml` — пример; перед запуском подставьте реальный Kaggle mount.
-
-## 3. Сбор rollout'ов
-
-В каноническом пути не нужно запускать vLLM вручную: `swegemma` и
-`adk-submission` сами поднимают tensor-parallel server, валидируют submission и
-регистрируют найденные LoRA-адаптеры. В competition notebook реестр модели уже
-настроен. В другом окружении передайте поддерживаемый harness-файл через
-`--models-yaml /path/to/models.yaml`.
-
-Сначала обязательно smoke test на одной задаче:
-
-```bash
-gemma-grpo collect \
-  --config configs/smoke.yaml \
-  --tasks /kaggle/input/COMPETITION_DATA/tasks.jsonl \
-  --snapshots-dir /kaggle/input/COMPETITION_DATA/snapshots \
-  --task-id ACTUAL_TASK_ID \
-  --iteration 0 \
-  --output rollouts/smoke.jsonl
-```
-
-После проверки — полноценная группа:
-
-```bash
-gemma-grpo collect \
-  --config configs/grpo.yaml \
-  --tasks /kaggle/input/COMPETITION_DATA/tasks.jsonl \
-  --snapshots-dir /kaggle/input/COMPETITION_DATA/snapshots \
-  --task-id ACTUAL_TASK_ID \
-  --iteration 0 \
-  --output rollouts/iter_0000.jsonl
-```
-
-Каждый seed получает отдельный result directory. В Kaggle-конфигах используется
-официальный `subprocess` sandbox SWEGemma, потому что Kaggle не предоставляет
-Docker daemon. Ошибка evaluation worker/sandbox записывается как
-`scorable=false` и не превращается в ложный negative reward. Для локального
-запуска с Docker поменяйте `rollout.sandbox` обратно на `docker`.
-
-### Непрерывный режим без ручного collect/train
-
-Если используемая версия competition harness сама поднимает vLLM только на время
-`swegemma eval` и гарантированно освобождает его после команды, отдельные команды
-ниже не нужны. Launcher обновляет adapter, меняет seeds и собирает свежие
-rollout'ы до указанного числа optimizer steps:
-
-```bash
-gemma-grpo loop \
-  --config configs/grpo.yaml \
-  --tasks /kaggle/input/COMPETITION_DATA/tasks.jsonl \
-  --snapshots-dir /kaggle/input/COMPETITION_DATA/snapshots \
-  --model-path /kaggle/input/ACTUAL_MODEL_DIRECTORY \
-  --task-id TASK_ID_1 \
-  --task-id TASK_ID_2 \
-  --task-id TASK_ID_3 \
-  --work-dir runs/grpo-001 \
-  --target-steps 100
-```
-
-Для старта с SFT LoRA добавьте:
-
-```bash
-  --initial-adapter outputs/sft_adapter
-```
-
-Состояние атомарно сохраняется в `runs/grpo-001/loop_state.json`. После
-прерывания тот же запуск продолжается с `--resume`. Если группа имеет одинаковые
-reward и нулевой advantage, launcher не делает фиктивный optimizer step, а
-автоматически собирает следующую группу с другим набором seed.
-
-Важно: если `--models-yaml` указывает на вручную поднятый внешний vLLM
-(`127.0.0.1:8000`), launcher не владеет его процессом и не может освободить VRAM
-перед backward. Такой server надо пока останавливать отдельно; полностью managed
-lifecycle отмечен как открытый пункт аудита.
-
-## 4. GRPO update
-
-Дождитесь завершения `collect`, чтобы запущенный harness model server освободил
-GPU. Server и backward 31B-модели обычно не помещаются одновременно на тех же
-четырёх L4.
-
-```bash
-gemma-grpo train \
-  --config configs/grpo.yaml \
-  --model-path /kaggle/input/ACTUAL_MODEL_DIRECTORY \
-  --rollouts rollouts/iter_0000.jsonl \
-  --output-dir outputs/adapter_iter_0001
-```
-
-Trainer обновляет только LoRA-параметры. Backbone выполняется один раз на всю
-последовательность, после чего выбираются hidden states перед assistant-токенами,
-а `lm_head + log_softmax` считаются кусками по `grpo.logprob_chunk_size`. При
-6 574 action-токенах и vocab 262 144 старый полный FP32 tensor занимал 6.42 GiB;
-chunk size 32 уменьшает этот временный tensor примерно до 32 MiB. Для backward
-куски пересчитываются activation checkpointing'ом и не остаются все в VRAM.
-
-Каждый `train` автоматически пишет рядом с output directory телеметрию, например
-`adapter_iter_0001.telemetry.jsonl`. Она содержит текущую фазу, utilization/VRAM/
-power/temperature всех GPU, PyTorch allocated/reserved, CPU, RSS и RAM. Сводка:
-
-```bash
-gemma-grpo telemetry --input outputs/adapter_iter_0001.telemetry.jsonl
-```
-
-Файл не перезаписывается при повторном запуске: создаются суффиксы `-v2`, `-v3`.
-
-В Kaggle-конфигах используется `model.load_mode: bnb4`. Обычный BF16 checkpoint
-при этом загружается стандартным QLoRA-путём. Competition checkpoint в формате
-`compressed-tensors` сначала распаковывается в системной RAM, а затем каждый
-Linear по отдельности переквантовывается в bitsandbytes NF4 на scratch GPU и
-возвращается на CPU до финального распределения по четырём L4. Поэтому на GPU
-base остаётся 4-битной, но это не bit-exact исходный QAT W4: между rollout и
-trainer base появляется небольшая ошибка повторного квантования.
-
-GPU 0 получает меньший weight budget (`gpu0_reserve_gib: 8`), потому что на нём
-также лежат embeddings/lm_head и выполняется vocabulary projection. Остальные
-GPU резервируют по 4 GiB. Это распределение слоёв — последовательный model
-parallel: один microbatch идёт через устройства по очереди. Поэтому одновременные
-100% на четырёх GPU здесь не ожидаются; для настоящего параллельного backward
-нужна отдельная FSDP/DeepSpeed/tensor-parallel архитектура.
-
-Группы с одинаковым reward имеют нулевой advantage и пропускаются. Для реального
-сигнала стоит выбирать задачи, где текущая policy иногда решает задачу, а иногда
-нет. Если resolved rate строго 0%, сначала полезнее SFT/trajectory distillation
-на reference patches, чем увеличивать число бессигнальных GRPO-rollout'ов.
-
-## 5. Следующая итерация
-
-Соберите свежую policy-группу, передав адаптер. Collector временно помещает его
-в `submission/adapters/main_lora`, а harness сам регистрирует его в vLLM:
-
-```bash
-gemma-grpo collect \
-  --config configs/grpo.yaml \
-  --tasks /kaggle/input/COMPETITION_DATA/tasks.jsonl \
-  --snapshots-dir /kaggle/input/COMPETITION_DATA/snapshots \
-  --task-id ACTUAL_TASK_ID \
-  --iteration 1 \
-  --adapter outputs/adapter_iter_0001 \
-  --output rollouts/iter_0001.jsonl
-```
-
-Не запускайте `train` повторно на том же JSONL с уже изменённым adapter. Несколько
-внутренних `grpo.epochs` используют одну зафиксированную behavior-policy; после
-завершения команды нужны свежие rollout'ы.
-
-Следующий update обязан стартовать с policy, которая породила rollout. Команда
-проверит fingerprint и остановится при несовпадении:
-
-```bash
-gemma-grpo train \
-  --config configs/grpo.yaml \
-  --model-path /kaggle/input/ACTUAL_MODEL_DIRECTORY \
-  --resume-adapter outputs/adapter_iter_0001 \
-  --rollouts rollouts/iter_0001.jsonl \
-  --output-dir outputs/adapter_iter_0002
-```
-
-## 6. Экспорт submission
-
-```bash
-gemma-grpo export \
-  --adapter outputs/adapter_iter_0001 \
-  --output dist/submission.zip
-```
-
-Экспорт добавляет `adapter: main_lora` в `agent.yaml`, кладёт PEFT adapter в
-`adapters/main_lora/` и проверяет лимит архива 3 GiB. Перед отправкой обязательно
-прогоните этот ZIP тем же `swegemma eval`, который установлен в competition
-notebook.
-
-## Ограничения, которые нельзя игнорировать
-
-- Это экспериментальный trainer для competition harness, не официальный код
-  Google/Kaggle и не гарантия совместимости любого wheel/model revision.
-- Полный GRPO на 31B — тяжёлый workload. Начинайте с 1–3 задач, 2 rollout'ов и
-  4k context; только после успешного backward переходите к группе 4 и 32k.
-- `device_map="auto"` + LoRA подходит для первичного QLoRA-style эксперимента,
-  но для устойчивого многодневного обучения лучше FSDP/DeepSpeed и отдельный
-  rollout cluster.
-- Если rollout имеет `token_source=chat_template_reconstruction`, его токены
-  восстановлены, а не взяты из vLLM bit-for-bit. Для длинного запуска предпочитайте
-  ATIF traces с полными `prompt_token_ids`/`completion_token_ids` всех LLM calls.
-- Для честной оценки держите закрытый validation split и не выбирайте checkpoint
-  по public leaderboard.
-
-Полный аудит пути обучения, исправленные дефекты и критерии допуска к длинному
-run описаны в [`docs/training-audit.md`](docs/training-audit.md).
-
-Полезные первичные материалы: [официальный Getting Started notebook](https://www.kaggle.com/code/ryanholbrook/getting-started-gemma-4-developer-agent/input),
-[competition page](https://www.kaggle.com/competitions/gemma-4-developer-agent/overview),
-[TRL GRPO documentation](https://huggingface.co/docs/trl/main/en/grpo_trainer).
-
-Пошаговый перенос проекта в competition notebook с L4 x4 описан в
-`kaggle/README.md`.
-
+- Hardware smoke FSDP+QLoRA на конкретном Kaggle image обязателен: локальные
+  CPU tests не эмулируют 4×L4, NCCL и BNB kernels.
+- Final evaluator использует официальный W4 base. NF4 rollout/train теперь
+  согласованы между собой, но перед submission нужен отдельный regression eval
+  adapter'а на W4 base.
+- Реконструкция chat template не гарантирует bit-exact совпадение токенов vLLM;
+  для длинного run предпочтительны полные ATIF token IDs.
+- 32k context не считается подтверждённым, пока telemetry smoke не покажет
+  запас VRAM. Начинайте с `configs/smoke.yaml` (8192).

@@ -1,16 +1,15 @@
 model:
-  name_or_path: /path/to/model
+  name_or_path: /kaggle/working/models/gemma-4-31b-nf4
   trust_remote_code: false
   torch_dtype: bfloat16
-  # The competition compressed-tensors checkpoint is staged/decompressed on
-  # CPU and requantized layer-by-layer to trainable bitsandbytes NF4.
-  load_mode: bnb4
-  device_map: balanced
-  max_memory_per_gpu_gib: 22
-  # GPU 0 also owns embeddings/lm_head and receives every vocabulary
-  # projection, so leave it more activation headroom than the layer GPUs.
-  gpu0_reserve_gib: 8
-  other_gpu_reserve_gib: 4
+  # Must be the persistent output of `gemma-grpo convert-nf4`.
+  load_mode: nf4
+  device_map: null
+distributed:
+  strategy: fsdp
+  num_processes: 4
+  cpu_offload: false
+  limit_all_gathers: true
 lora:
   r: 8
   alpha: 16
@@ -20,10 +19,10 @@ grpo:
   learning_rate: 5.0e-6
   beta: 0.01
   clip_epsilon: 0.2
-  group_size: 2
+  group_size: 4
   epochs: 1
   max_steps: 1
-  # The two-rollout smoke task currently produces ~6.5k-7.7k token traces.
+  # The smoke task currently produces ~6.5k-7.7k token traces.
   max_seq_length: 8192
   # Bounds temporary lm_head/log-softmax memory to roughly tens of MiB.
   logprob_chunk_size: 32
@@ -37,10 +36,17 @@ rollout:
   sandbox: subprocess
   image: null
   concurrency: 1
-  max_tool_calls: 5
-  max_time_minutes: 5
+  # The earlier 5-call smoke exhausted its budget before submit_patch and
+  # produced only empty patches. Keep the real agent budget for a trainable group.
+  max_tool_calls: 20
+  max_time_minutes: 10
   timeout_seconds: null
-  seeds: [101, 202]
+  seeds: [101, 202, 303, 404]
+  managed_vllm: true
+  vllm_port: 8000
+  vllm_tensor_parallel_size: 4
+  vllm_gpu_memory_utilization: 0.9
+  vllm_startup_timeout_seconds: 900
 reward:
   resolved: 1.0
   failed: 0.0

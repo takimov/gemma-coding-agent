@@ -5,8 +5,11 @@ import pytest
 
 from gemma_grpo.tokenization import TokenizedTrajectory
 from gemma_grpo.train import (
+    _build_selective_logprob_model,
+    _distributed_rollout_logprobs,
     _no_split_module_classes,
     _next_telemetry_path,
+    _policy_state_dict,
     _project_action_logprobs,
     _selected_logprobs,
     _validate_trajectory,
@@ -136,3 +139,45 @@ def test_selected_logprobs_use_previous_positions_without_full_causal_lm_logits(
     )
 
     assert torch.allclose(actual, expected)
+
+
+def test_selective_wrapper_keeps_projection_inside_model_forward():
+    policy = _TinyPeftLike()
+    wrapped = _build_selective_logprob_model(policy, chunk_size=1)
+    trajectory = TokenizedTrajectory(input_ids=[2, 4, 6, 8], action_positions=[1, 3])
+
+    actual = _selected_logprobs(wrapped, trajectory, chunk_size=999)
+    expected = _selected_logprobs(policy, trajectory, chunk_size=1)
+
+    assert torch.allclose(actual, expected)
+
+
+def test_distributed_logprobs_match_local_path_for_one_rank():
+    policy = _TinyPeftLike()
+    wrapped = _build_selective_logprob_model(policy, chunk_size=1)
+    segments = [
+        TokenizedTrajectory(input_ids=[2, 4, 6], action_positions=[1, 2]),
+        TokenizedTrajectory(input_ids=[1, 3], action_positions=[1]),
+    ]
+
+    actual, padding_anchor = _distributed_rollout_logprobs(
+        wrapped,
+        segments,
+        chunk_size=1,
+        input_device=torch.device("cpu"),
+        world_size=1,
+        dummy_token_id=0,
+    )
+    expected = torch.cat(
+        [_selected_logprobs(wrapped, segment, chunk_size=1) for segment in segments]
+    )
+
+    assert torch.allclose(actual, expected)
+    assert padding_anchor.item() == 0.0
+
+
+def test_policy_state_dict_removes_fsdp_wrapper_prefix():
+    value = torch.tensor([1.0])
+    assert _policy_state_dict({"policy.base_model.lora_A": value}) == {
+        "base_model.lora_A": value
+    }

@@ -11,6 +11,7 @@ from .config import ExperimentConfig
 from .policy import ADAPTER_FILES
 from .tasks import read_jsonl
 from .train import train_adapter
+from .vllm_server import rollout_models_yaml
 
 
 STATE_VERSION = 1
@@ -160,18 +161,25 @@ def run_training_loop(
                 f"{current_adapter or 'base'}; steps={state['optimizer_steps']}/{target_steps}",
                 flush=True,
             )
-            rows = collect_rollouts(
+            with rollout_models_yaml(
                 config=collection_config,
-                tasks_path=tasks_path,
-                snapshots_dir=snapshots_dir,
-                submission_dir=submission_dir,
-                results_root=work_dir / "results",
-                output_path=rollout_path,
-                iteration=collection_index,
-                selected_ids=selected_ids,
+                model_path=model_path or config.model.name_or_path,
                 adapter=current_adapter,
-                models_yaml=models_yaml,
-            )
+                work_dir=work_dir / "vllm" / f"collection_{collection_index:04d}",
+                external_models_yaml=models_yaml,
+            ) as active_models_yaml:
+                rows = collect_rollouts(
+                    config=collection_config,
+                    tasks_path=tasks_path,
+                    snapshots_dir=snapshots_dir,
+                    submission_dir=submission_dir,
+                    results_root=work_dir / "results",
+                    output_path=rollout_path,
+                    iteration=collection_index,
+                    selected_ids=selected_ids,
+                    adapter=current_adapter,
+                    models_yaml=active_models_yaml,
+                )
             trainable_groups = sorted(
                 {str(row["group_id"]) for row in rows if row.get("trainable")}
             )

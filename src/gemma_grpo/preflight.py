@@ -5,17 +5,39 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
+from packaging.version import InvalidVersion, Version
 
 from .config import ExperimentConfig
+from .nf4 import assert_nf4_checkpoint
 from .tasks import read_jsonl
 from .tokenization import assert_prefix_preserving
+from .vllm_server import vllm_bnb_plugin_status
 
 
-PACKAGES = ("swegemma", "adk-submission", "adk-eval-core", "transformers", "peft", "torch")
+PACKAGES = (
+    "swegemma",
+    "adk-submission",
+    "adk-eval-core",
+    "transformers",
+    "peft",
+    "torch",
+    "accelerate",
+    "bitsandbytes",
+    "vllm",
+    "vllm-bnb-plugin",
+)
+MINIMUM_PACKAGE_VERSIONS = {
+    "accelerate": "1.10",
+    "bitsandbytes": "0.48.1",
+    "peft": "0.17",
+    "transformers": "5.0",
+    "vllm-bnb-plugin": "0.0.3",
+}
 ALLOWED_TOOLS = {
     "run_command",
     "submit_patch",
@@ -88,7 +110,16 @@ def run_preflight(
             version = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             version = "not installed"
-        record(f"package {package}", version != "not installed", version)
+        minimum = MINIMUM_PACKAGE_VERSIONS.get(package)
+        compatible = version != "not installed"
+        detail = version
+        if compatible and minimum is not None:
+            try:
+                compatible = Version(version) >= Version(minimum)
+            except InvalidVersion:
+                compatible = False
+            detail = f"{version}; required >= {minimum}"
+        record(f"package {package}", compatible, detail)
 
     required_submission = (
         submission_dir / "agent.yaml",
@@ -143,11 +174,65 @@ def run_preflight(
         f"group_size={config.grpo.group_size}, seeds={len(config.rollout.seeds)}",
     )
 
+    path = Path(model_path or config.model.name_or_path)
+    if config.model.load_mode == "nf4":
+        try:
+            assert_nf4_checkpoint(
+                path,
+                require_fsdp_storage=config.distributed.strategy == "fsdp",
+            )
+            record("saved NF4 checkpoint", True, str(path))
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            record("saved NF4 checkpoint", False, str(error))
+
+    try:
+        import torch
+
+        gpu_count = torch.cuda.device_count()
+        required_gpus = max(
+            config.distributed.num_processes
+            if config.distributed.strategy == "fsdp"
+            else 1,
+            config.rollout.vllm_tensor_parallel_size if config.rollout.managed_vllm else 1,
+        )
+        record(
+            "CUDA device count",
+            gpu_count >= required_gpus,
+            f"visible={gpu_count}, required={required_gpus}",
+        )
+    except ImportError as error:
+        record("CUDA device count", False, str(error))
+
+    if config.rollout.managed_vllm:
+        plugin_ok, plugin_detail = vllm_bnb_plugin_status()
+        record("vLLM BitsAndBytes plugin", plugin_ok, plugin_detail)
+        completed = subprocess.run(
+            [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        required_flags = [
+            "--tensor-parallel-size",
+            "--served-model-name",
+            "--quantization",
+            "--load-format",
+            "--enable-lora",
+            "--lora-modules",
+            "--max-lora-rank",
+            "--max-loras",
+        ]
+        missing = [flag for flag in required_flags if flag not in completed.stdout]
+        record(
+            "managed vLLM NF4/LoRA flags",
+            completed.returncode == 0 and not missing,
+            "ok" if not missing else f"missing: {', '.join(missing)}",
+        )
+
     if check_tokenizer:
         try:
             from transformers import AutoTokenizer
 
-            path = model_path or config.model.name_or_path
             tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=config.model.trust_remote_code)
             assert_prefix_preserving(tokenizer)
             record("chat template prefix preservation", True, str(path))

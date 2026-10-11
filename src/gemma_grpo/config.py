@@ -24,6 +24,11 @@ class RolloutConfig:
     max_time_minutes: int = 15
     timeout_seconds: int | None = None
     seeds: tuple[int, ...] = (101, 202, 303, 404)
+    managed_vllm: bool = True
+    vllm_port: int = 8000
+    vllm_tensor_parallel_size: int = 4
+    vllm_gpu_memory_utilization: float = 0.9
+    vllm_startup_timeout_seconds: int = 900
 
 
 @dataclass(frozen=True)
@@ -55,11 +60,16 @@ class ModelConfig:
     name_or_path: str
     trust_remote_code: bool = False
     torch_dtype: str = "bfloat16"
-    load_mode: str = "native"
-    device_map: str = "balanced"
-    max_memory_per_gpu_gib: int | None = None
-    gpu0_reserve_gib: int = 8
-    other_gpu_reserve_gib: int = 4
+    load_mode: str = "nf4"
+    device_map: str | None = None
+
+
+@dataclass(frozen=True)
+class DistributedConfig:
+    strategy: str = "fsdp"
+    num_processes: int = 4
+    cpu_offload: bool = False
+    limit_all_gathers: bool = True
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,7 @@ class ExperimentConfig:
     grpo: GrpoConfig
     rollout: RolloutConfig
     reward: RewardConfig
+    distributed: DistributedConfig
 
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
@@ -95,6 +106,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         grpo=GrpoConfig(**_section(raw, "grpo")),
         rollout=RolloutConfig(**rollout_raw),
         reward=RewardConfig(**_section(raw, "reward")),
+        distributed=DistributedConfig(**_section(raw, "distributed")),
     )
     if config.grpo.group_size != len(config.rollout.seeds):
         raise ValueError(
@@ -119,20 +131,41 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("lora.r must be between 1 and the competition maximum of 128")
     if config.lora.dropout != 0.0:
         raise ValueError("lora.dropout must be 0 for deterministic old/new policy log-probabilities")
-    if config.model.load_mode not in {"native", "bnb4"}:
-        raise ValueError("model.load_mode must be 'native' or 'bnb4'")
-    if config.model.device_map not in {"auto", "balanced", "balanced_low_0", "sequential"}:
+    if config.model.load_mode not in {"native", "nf4"}:
+        raise ValueError("model.load_mode must be 'native' or 'nf4'")
+    if config.model.device_map not in {
+        None,
+        "auto",
+        "balanced",
+        "balanced_low_0",
+        "sequential",
+    }:
         raise ValueError(
-            "model.device_map must be one of: auto, balanced, balanced_low_0, sequential"
+            "model.device_map must be null or one of: auto, balanced, balanced_low_0, sequential"
         )
-    if (
-        config.model.max_memory_per_gpu_gib is not None
-        and config.model.max_memory_per_gpu_gib < 1
-    ):
-        raise ValueError("model.max_memory_per_gpu_gib must be positive")
-    if config.model.gpu0_reserve_gib < 1:
-        raise ValueError("model.gpu0_reserve_gib must be positive")
-    if config.model.other_gpu_reserve_gib < 1:
-        raise ValueError("model.other_gpu_reserve_gib must be positive")
+    if config.distributed.strategy not in {"none", "fsdp"}:
+        raise ValueError("distributed.strategy must be 'none' or 'fsdp'")
+    if config.distributed.num_processes < 1:
+        raise ValueError("distributed.num_processes must be positive")
+    if config.distributed.strategy == "fsdp":
+        if config.distributed.num_processes < 2:
+            raise ValueError("FSDP requires at least two processes")
+        if config.model.load_mode != "nf4":
+            raise ValueError("FSDP training requires model.load_mode: nf4")
+        if config.model.device_map is not None:
+            raise ValueError("FSDP owns device placement; set model.device_map: null")
+        if config.grpo.group_size % config.distributed.num_processes:
+            raise ValueError(
+                "grpo.group_size must be divisible by distributed.num_processes "
+                "so every FSDP rank receives the same number of trajectories"
+            )
+    if not 1 <= config.rollout.vllm_port <= 65535:
+        raise ValueError("rollout.vllm_port must be a valid TCP port")
+    if config.rollout.vllm_tensor_parallel_size < 1:
+        raise ValueError("rollout.vllm_tensor_parallel_size must be positive")
+    if not 0 < config.rollout.vllm_gpu_memory_utilization < 1:
+        raise ValueError("rollout.vllm_gpu_memory_utilization must be between 0 and 1")
+    if config.rollout.vllm_startup_timeout_seconds < 1:
+        raise ValueError("rollout.vllm_startup_timeout_seconds must be positive")
     return config
 

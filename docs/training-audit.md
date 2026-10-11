@@ -1,144 +1,136 @@
-# Аудит GRPO training path на Kaggle L4 x4
+# Аудит FSDP-QLoRA GRPO path
 
-Дата аудита: 2026-10-11. Целевая конфигурация: Gemma 4 31B QAT W4 checkpoint,
-четыре NVIDIA L4 по 22.03 GiB, LoRA/QLoRA и SWEGemma rollouts.
+Дата: 2026-10-11. Цель: Gemma 4 31B, Kaggle 4×NVIDIA L4 22 GiB,
+rollout и training на одном сохранённом NF4 base.
 
-## Итог
+## Новый lifecycle
 
-Причина последнего OOM локализована: trainer создавал полный FP32 tensor
-`action_tokens × vocabulary` внутри `log_softmax`. Для наблюдавшихся 6 574
-assistant-токенов и vocab 262 144 это ровно около 6.42 GiB поверх уже размещённой
-модели. Это не утечка и не фрагментация allocator'а.
+```text
+saved NF4 base
+    ├─ vLLM + BNB plugin, TP=4 → SWEGemma rollouts → stop process group
+    └─ 4 train ranks, FSDP FULL_SHARD + QLoRA → save LoRA adapter
+                                                    │
+                                                    └─ next NF4 rollout
+```
 
-Код исправлен: backbone считается один раз, нужные hidden states выбираются до
-`lm_head`, vocabulary projection и `log_softmax` идут chunk'ами по 32 токена,
-а chunk forward пересчитывается checkpointing'ом при backward. GPU 0 дополнительно
-получает 8 GiB резерва против 4 GiB на остальных GPU.
+Оригинальный competition W4 checkpoint участвует только в одноразовой
+`convert-nf4`. Каждый следующий collect/train перечитывает NF4 с диска, но не
+распаковывает W4 и не делает повторную квантизацию.
 
-CPU unit/regression suite проходит, но полная совместимость direct backbone path,
-Accelerate hooks, bitsandbytes NF4 и Gemma 4 31B должна быть подтверждена одним
-hardware smoke на Kaggle. До такого прогона исправление считается проверенным
-логически и на малой модели, но не подтверждённым end-to-end на L4.
+## Что исправлено
 
-## Исправленные дефекты
-
-| Приоритет | Дефект | Исправление |
+| Приоритет | Проблема | Решение |
 |---|---|---|
-| P0 | FP32 `6574 × 262144` logits требовали 6.42 GiB на GPU 0 | Chunked `lm_head + log_softmax`, default 32, activation checkpointing |
-| P0 | Прямой chunked `lm_head` мог обойти Gemma 4 `final_logit_softcapping` и исказить log-probabilities | В каждом chunk применяется точная model-specific формула до `log_softmax` |
-| P0 | GPU 0 имел тот же weight budget, хотя держит embeddings/lm_head | Резерв 8 GiB на GPU 0 и 4 GiB на GPU 1–3 |
-| P1 | Длинная траектория отбрасывалась отдельно, но advantage оставался нормирован по полной группе | Если один rollout слишком длинный, пропускается вся группа |
-| P1 | `max_steps` применялся до tokenization и мог выбрать только непригодные группы | Лимит теперь считает пригодные группы |
-| P1 | Частичные ATIF token IDs могли тихо исключить некоторые assistant turns | Exact-token режим используется только при наличии IDs у всех assistant calls |
-| P1 | Rollout без trainable assistant trace мог получить reward и попасть в группу | Такой rollout помечается `missing_trainable_trace`, `scorable=false` |
-| P1 | NaN/Inf objective или gradient мог попасть в optimizer | Явные finite-checks до `backward`/`step` |
-| P2 | Ошибки длины обнаруживались после пятиминутной загрузки 31B | Rollouts токенизируются и проверяются до model load |
-| P2 | Повторный запуск мог затереть telemetry падения | Следующий файл получает суффикс `-v2`, `-v3`, ... |
+| P0 | Последовательный `device_map` нагружал GPU по очереди | Четыре FSDP rank, `FULL_SHARD`, одна trajectory/rank |
+| P0 | Каждый update делал W4 → BF16 → NF4 | Отдельный постоянный pre-quantized NF4 checkpoint |
+| P0 | Rollout был W4, training NF4 | Managed vLLM тоже читает тот же NF4 base |
+| P0 | vLLM 0.19.1 больше не содержит встроенный BNB loader | Зафиксированный официальный `vllm-bnb-plugin` wheel в offline dataset и preflight entry-point check |
+| P0 | Полный FP32 `action_tokens × 262144` tensor давал OOM 6.42 GiB | Selective hidden states и chunked lm_head/log-softmax |
+| P0 | Разное число ATIF segments на ranks нарушает порядок FSDP collectives | Tiny zero-loss padding forwards участвуют и в backward graph |
+| P1 | Checkpointed lm_head мог обратиться к уже reshared weight | Frozen tied embedding/lm_head реплицирован BF16 и исключён из FSDP |
+| P1 | Trainable parameter внутри ignored projection не синхронизировался бы | Явная проверка и отказ до training |
+| P1 | Partial ATIF IDs обучали только часть trajectory | Exact path только при token IDs всех assistant calls |
+| P1 | Advantage полной группы сохранялся после удаления длинной trajectory | При oversize пропускается вся группа |
+| P1 | NaN/Inf попадал в optimizer | Finite checks objective и gradient norm |
 
-## Почему не загружены все четыре GPU одновременно
+## Память и форматы
 
-`infer_auto_device_map + dispatch_model` раскладывает последовательные decoder
-layers по GPU. Один microbatch сначала исполняет ранние layers на GPU 0, затем
-передаёт activations на GPU 1, GPU 2 и GPU 3. Это pipeline-like model placement
-без pipeline microbatch schedule, а не tensor parallel и не data parallel.
+`bnb_4bit_quant_storage=torch.bfloat16` не означает BF16-веса. BitsAndBytes
+упаковывает четыре 4-битных значения в один BF16 storage element; float storage
+нужен потому, что FSDP не шардирует integer parameters. Compute dtype тоже BF16.
 
-Дополнительно:
+Не квантуются:
 
-- NF4 requantization намеренно использует GPU 0 как scratch device;
-- embeddings и `lm_head` находятся на GPU 0;
-- batch фактически равен одной траектории, потому что 6–8k token agent traces
-  обрабатываются последовательно ради памяти.
+- tied token embedding/lm_head — frozen BF16, около 2.8 GiB на каждом GPU;
+- layer norms и малые служебные tensors;
+- LoRA A/B — trainable floating parameters;
+- optimizer state только для LoRA.
 
-Поэтому граф utilization будет пилообразным. Добиваться одновременных 100% на
-всех L4 настройкой batch size в текущей архитектуре нельзя. Для этого нужен
-отдельный trainer на FSDP/DeepSpeed или tensor/pipeline parallel с несколькими
-microbatch, а также иной способ сосуществования с rollout server.
+Поэтому «всё NF4» здесь означает все крупные подходящие Linear base weights,
+как в стандартном QLoRA, а не буквальный NF4 для каждого tensor модели.
 
-## Что измеряется
+## GRPO и distributed correctness
 
-`TrainingMonitor` пишет sample каждые 5 секунд и немедленно при смене фазы:
+Группа из четырёх rollout'ов делится по ranks как `prepared[rank::4]`. Каждый
+rank считает loss своей trajectory. FSDP усредняет gradients; если у rank
+несколько trajectories, local loss сначала усредняется локально. Metrics затем
+суммируются через `accelerator.reduce`.
 
-- exact phase и elapsed time;
-- GPU compute utilization и memory-controller utilization;
-- NVML VRAM used/total, power и temperature для всех устройств;
-- process-local PyTorch allocated/reserved/max-allocated для каждого GPU;
-- process CPU%, CPU time, RSS и threads;
-- system available RAM и load average.
+До первого optimizer step для всех выбранных групп фиксируются:
 
-Фазы включают `load_checkpoint_cpu`, `requantize_nf4`, `prepare_kbit`,
-`inject_lora`/`load_lora`, `infer_device_map`, `dispatch_model`, `cache_old`,
-`cache_reference`, `forward_backward`, `optimizer` и `save_adapter`.
+- behavior-policy log-probabilities с текущим adapter;
+- reference log-probabilities того же NF4 base с отключённым adapter.
 
-Агрегация:
+Adapter fingerprint запрещает обучать rollout не той starting policy. После
+завершения update нужны новые rollout'ы.
+
+Exact ATIF trajectory может содержать разное число LLM calls. Один decoder
+forward на одном rank обязан иметь соответствующий forward на остальных ranks.
+Максимальное число segments согласуется `all_reduce(MAX)`; недостающие calls
+дополняются двухтокенными forwards. Их output умножается на ноль, но остаётся в
+loss graph, поэтому backward collectives тоже вызываются одинаковое число раз.
+
+## Monitoring
+
+Rank 0 пишет phase telemetry каждые 5 секунд:
+
+- NVML utilization, memory-controller utilization, VRAM, power и temperature
+  для всех четырёх GPU;
+- local PyTorch allocated/reserved/max-allocated;
+- CPU%, RSS, system available RAM и load average;
+- фазы tokenize, NF4 load, FSDP wrap, old/reference cache, forward/backward,
+  optimizer, full-state gather и adapter save.
 
 ```bash
 gemma-grpo telemetry --input /path/to/adapter.telemetry.jsonl
 ```
 
-Вывод содержит и точные фазы с group/seed, и `phase_kinds`, где все seed одной
-операции объединены.
+В отличие от старого sequential device map, во время decoder forward/backward
+ожидается активность всех четырёх GPU. Короткие провалы между trajectories и во
+время CPU/tokenization являются нормальными.
 
-## Оставшиеся риски
+## Остаточные риски
 
-### 1. Rollout policy и trainer policy не bit-exact (высокий)
+### Hardware smoke ещё обязателен
 
-vLLM генерирует исходным QAT W4 checkpoint, а trainer распаковывает его и
-переквантовывает в bitsandbytes NF4. `old_logprobs` пересчитываются NF4-моделью,
-а не сохраняются непосредственно во время sampling. Fingerprint адаптера
-проверяет LoRA policy, но не устраняет расхождение base kernels/quantization.
+CPU tests проверяют orchestration, loss и форматы, но не могут подтвердить
+совместимость Gemma 4 31B + Transformers 5.0 + PEFT 0.19.1 + Accelerate 1.13 +
+Torch 2.10 + BNB kernels + NCCL на L4. До одного полного Kaggle smoke новый
+путь логически проверен, но не hardware-validated.
 
-Для строго on-policy GRPO нужно либо сохранять выбранные token log-probabilities
-из rollout server, либо считать rollout и backward одной и той же bit-exact
-моделью. Текущий путь — практическое приближение.
+### Full-state adapter save
 
-### 2. Текущие smoke rollouts реконструированы chat template (высокий)
+PEFT/FSDP требует переключиться на `FULL_STATE_DICT` перед обычным
+`save_pretrained`. Это создаёт кратковременный CPU/RAM и communication peak в
+конце update. Системных 173 GiB должно хватить, но telemetry должна подтвердить.
 
-В наблюдавшихся строках `token_source=chat_template_reconstruction`, а tools
-definitions отсутствуют. Prefix preservation проверена, но это не доказывает
-совпадение токенов с vLLM. Для длинного обучения нужны полные ATIF
-`prompt_token_ids`/`completion_token_ids` для каждого assistant call либо
-отдельная валидация token-by-token против serving request.
+### 32k activations
 
-### 3. Accelerate device map — не полноценный distributed trainer (средний)
+Chunked vocabulary projection убирает известный пик logits, но не decoder
+activations. Smoke ограничен 8192; увеличивать 12k → 16k → 32k нужно только по
+фактическому запасу VRAM.
 
-Autograd через dispatch hooks должен быть подтверждён hardware smoke. Даже после
-успеха это решение годится для эксперимента, но не даёт равномерного throughput.
+### Token reconstruction
 
-### 4. 32k context пока не подтверждён (средний)
+`chat_template_reconstruction` не гарантирует token-by-token совпадение с vLLM.
+Наиболее надёжны traces с `prompt_token_ids` и `completion_token_ids` каждого
+assistant call.
 
-Chunked vocabulary projection убирает конкретный 6.42 GiB пик, но не память
-transformer activations. Smoke traces имеют примерно 6.5–7.7k токенов. Длину
-следует повышать 8k → 12k → 16k → 32k только по telemetry.
+### Final W4 evaluator
 
-### 5. Автоматический loop не владеет внешним vLLM server (высокий для local models.yaml)
-
-Если `models.yaml` указывает на вручную поднятый `127.0.0.1:8000`, команда
-`gemma-grpo loop` не умеет сама остановить этот чужой процесс перед backward и
-перезапустить его после adapter update. В таком режиме обещание полностью
-автоматического collect/train неверно: нужен managed server lifecycle. Без
-`models.yaml` это зависит от того, стартует ли конкретная версия competition
-harness server на время каждого `swegemma eval` и освобождает ли его после.
-
-До реализации managed lifecycle не запускать 100-step loop с оставленным
-локальным vLLM — он заберёт VRAM у trainer.
-
-### 6. Дорогая перезагрузка между update (средний)
-
-Каждый train update заново распаковывает 31B и делает NF4 requantization. Это
-необходимо при переиспользовании тех же GPU для vLLM и backward, но дорого.
-Собирайте несколько задач/групп перед одним update, чтобы амортизировать загрузку.
+On-policy пара теперь согласована внутри NF4: rollout и trainer используют один
+base. Но competition submission будет исполняться на официальном QAT W4 base.
+LoRA module names совместимы, logits не bit-exact. Нужен отдельный W4 regression
+eval перед отправкой; это eval, а не возврат W4 в training loop.
 
 ## Критерии успешного smoke
 
-1. В логе есть четыре GPU weight-memory budget и device map без `cpu`/`disk`.
-2. Обе траектории проходят tokenization до model load.
-3. `cache_old`, `cache_reference` и оба `forward_backward` завершаются.
-4. `loss`, `kl`, `grad_norm` конечны; выполнен ровно один optimizer step.
-5. Созданы `adapter_config.json`, `adapter_model.safetensors` и
+1. Preflight подтверждает `vllm-bnb-plugin`, BNB ≥0.48.1, NF4/BF16 storage и 4 GPU.
+2. vLLM запускает NF4 TP=4, возвращает `/v1/models`, собирает 4 scorable rollout'а.
+3. Перед training в логе есть `[vllm] stopped`.
+4. FSDP world size равен 4; каждый rank получает trajectory.
+5. Завершаются old/reference cache, forward/backward и ровно один optimizer step.
+6. Loss, KL и grad norm конечны; telemetry не показывает OOM/CPU offload.
+7. Созданы `adapter_config.json`, `adapter_model.safetensors` и
    `training_metrics.json`.
-6. Telemetry заканчивается `complete`; ни один GPU не упирается устойчиво в
-   полный объём VRAM.
-
-Если OOM остаётся именно в vocabulary projection, уменьшить
-`logprob_chunk_size: 32` до 16. Если OOM возникает внутри backbone, chunk size
-не поможет: уменьшить `max_seq_length` или переходить на sharded training.
+8. Следующий managed vLLM стартует с сохранённым adapter и свежими seeds.

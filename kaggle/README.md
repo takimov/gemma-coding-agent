@@ -1,89 +1,41 @@
-# Запуск GRPO на Kaggle L4 x4
+# Kaggle 4×L4: FSDP + QLoRA + NF4 rollout
 
-## Быстрая синхронизация из GitHub
+Notebook работает с выключенным Internet. Managed loop использует один
+постоянный NF4 checkpoint и сам чередует vLLM TP=4 с FSDP `FULL_SHARD`=4.
+Одновременно эти процессы не живут: перед training vLLM завершается и отдаёт
+всю VRAM.
 
-Во время отладки удобнее держать Internet включённым и получать исправления из
-публичного GitHub-репозитория. Эта ячейка создаёт отдельный checkout при первом
-запуске, а затем делает только fast-forward pull, поэтому результаты обучения в
-`/kaggle/working/runs` не затрагиваются:
+## Обновление private source dataset
 
-```python
-from pathlib import Path
-import subprocess
-import sys
-
-REPO_URL = "https://github.com/takimov/gemma-coding-agent.git"
-BRANCH = "main"
-PROJECT = Path("/kaggle/working/gemma-grpo-live")
-
-if (PROJECT / ".git").is_dir():
-    subprocess.run(
-        ["git", "-C", str(PROJECT), "pull", "--ff-only", "origin", BRANCH],
-        check=True,
-    )
-else:
-    if PROJECT.exists():
-        raise RuntimeError(f"Refusing to overwrite non-git directory: {PROJECT}")
-    subprocess.run(
-        [
-            "git", "clone", "--depth", "1", "--branch", BRANCH,
-            REPO_URL, str(PROJECT),
-        ],
-        check=True,
-    )
-
-subprocess.run(
-    [
-        sys.executable, "-m", "pip", "install", "-e", str(PROJECT),
-        "--no-deps", "--no-build-isolation",
-    ],
-    check=True,
-)
-
-commit = subprocess.check_output(
-    ["git", "-C", str(PROJECT), "rev-parse", "--short", "HEAD"],
-    text=True,
-).strip()
-print("project:", PROJECT)
-print("commit:", commit)
-```
-
-Команды `gemma-grpo`, запускаемые после этого через `subprocess`, читают новую
-версию сразу. Уже импортированные в kernel модули `gemma_grpo` остаются в
-`sys.modules`; после обновления для прямых Python-импортов перезапустите kernel.
-Не выполняйте `git pull` посреди активного `collect` или `train`.
-
-Для notebook version, которая обязана работать с выключенным Internet,
-используйте ZIP/Kaggle Dataset из следующего раздела.
-
-После каждого проверенного commit приватный source dataset можно обновить с
-локального Mac официальным Kaggle CLI:
+На Mac, после commit:
 
 ```bash
 python scripts/publish_kaggle_dataset.py
 ```
 
-Publisher отказывается брать dirty worktree, архивирует именно Git `HEAD` и
-пишет полный commit hash в `commit.txt`. Dataset по умолчанию:
+Publisher архивирует Git `HEAD`, пишет `commit.txt` и собирает зафиксированный
+официальный `vllm-bnb-plugin` wheel. Он обязателен: в vLLM 0.19.1 NF4/BnB
+поддержка вынесена из основного пакета. Dataset по умолчанию:
 `timurakimoff/gemma-grpo-source`.
 
-## Inputs ноутбука
+## Inputs
 
-Создайте notebook из страницы соревнования и подключите четыре input:
+Подключите:
 
 1. competition data `gemma-4-developer-agent`;
-2. модель `google/gemma-4` с вариантом `gemma-4-31b-it-qat-w4a16-ct`;
-3. официальный dataset `metric/gemma-4-developer-agent-wheelhouse`;
-4. private dataset `timurakimoff/gemma-grpo-source` с файлом
-   `gemma-grpo-kaggle.zip` из этого проекта.
+2. `google/gemma-4`, вариант `gemma-4-31b-it-qat-w4a16-ct`;
+3. `metric/gemma-4-developer-agent-wheelhouse`;
+4. `timurakimoff/gemma-grpo-source`;
+5. со второй сессии — сохранённый NF4 checkpoint предыдущей версии notebook.
 
-В Settings выберите `GPU L4 x4` и оставьте Internet выключенным.
+Accelerator: `GPU L4 ×4`. Internet: Off.
 
-## Ячейка 1: найти mounts, распаковать код и установить пакеты
+## Ячейка 1 — код и офлайн-зависимости
 
 ```python
 from pathlib import Path
 import glob
+import json
 import shutil
 import subprocess
 import sys
@@ -93,73 +45,65 @@ INPUT = Path("/kaggle/input")
 PROJECT = Path("/kaggle/working/gemma-grpo")
 
 wheel_dir = next(INPUT.rglob("swegemma-*.whl")).parent
+plugin_wheel = next(INPUT.rglob("vllm_bnb_plugin-*.whl"))
 data_root = next(
     path.parent
     for path in INPUT.rglob("tasks.jsonl")
     if (path.parent / "snapshots").is_dir()
 )
-model_dir = next(
+source_w4 = next(
     path.parent
     for path in INPUT.rglob("config.json")
     if "gemma-4-31b-it-qat-w4a16-ct" in str(path.parent)
 )
 
 shutil.rmtree(PROJECT, ignore_errors=True)
-
-source_archives = list(INPUT.rglob("gemma-grpo-kaggle.zip"))
-source_directories = [
-    path for path in INPUT.rglob("gemma-grpo-kaggle") if path.is_dir()
-]
-if source_archives:
+archives = list(INPUT.rglob("gemma-grpo-kaggle.zip"))
+directories = [path for path in INPUT.rglob("gemma-grpo-kaggle") if path.is_dir()]
+if archives:
     PROJECT.mkdir(parents=True)
-    with zipfile.ZipFile(source_archives[0]) as archive:
+    with zipfile.ZipFile(archives[0]) as archive:
         archive.extractall(PROJECT)
-elif source_directories:
-    # Kaggle commonly expands an uploaded ZIP and mounts it as a directory
-    # whose name no longer has the .zip suffix.
-    shutil.copytree(source_directories[0], PROJECT)
+elif directories:
+    shutil.copytree(directories[0], PROJECT)
 else:
-    source_root = next(
-        path.parent
-        for path in INPUT.rglob("pyproject.toml")
-        if "gemma-swegemma-grpo" in path.read_text(encoding="utf-8")
-    )
-    shutil.copytree(source_root, PROJECT)
+    raise FileNotFoundError("gemma-grpo source archive is not attached")
+assert (PROJECT / "pyproject.toml").is_file(), PROJECT
 
-assert (PROJECT / "pyproject.toml").is_file(), (
-    f"Source was not materialized correctly under {PROJECT}"
-)
-
-# The official host wheelhouse is a self-contained, mutually compatible bundle.
-# Install all of it instead of naming vLLM dependencies one by one.  The
-# cutlass wheel is intentionally excluded, matching the competition example:
-# its .pth bootstrap conflicts with Kaggle's preinstalled CUDA environment.
+# Убираем конфликтующий cutlass bootstrap и устанавливаем полный официальный
+# wheelhouse ровно как в competition image.
 for pattern in (
     "/usr/local/lib/python*/dist-packages/*cutlass*.pth",
     "/usr/local/lib/python*/site-packages/*cutlass*.pth",
 ):
-    for path in glob.glob(pattern):
-        Path(path).unlink(missing_ok=True)
+    for filename in glob.glob(pattern):
+        Path(filename).unlink(missing_ok=True)
 
-normalized_wheels = Path("/tmp/gemma-host-wheelhouse")
-shutil.rmtree(normalized_wheels, ignore_errors=True)
-normalized_wheels.mkdir(parents=True)
+normalized = Path("/tmp/gemma-host-wheelhouse")
+shutil.rmtree(normalized, ignore_errors=True)
+normalized.mkdir()
 for wheel in wheel_dir.glob("*.whl"):
     if "cutlass" in wheel.name.lower():
         continue
-    # A few supplied CUDA wheels need a PEP 440 local-version separator.
     name = (
         wheel.name.replace("cu128", "+cu128")
         if "cu128" in wheel.name and "+" not in wheel.name
         else wheel.name
     )
-    (normalized_wheels / name).symlink_to(wheel)
+    (normalized / name).symlink_to(wheel)
 
 subprocess.run(
     [
         sys.executable, "-m", "pip", "install", "-q", "--no-deps",
         "--force-reinstall",
-        *sorted(str(path) for path in normalized_wheels.glob("*.whl")),
+        *sorted(str(path) for path in normalized.glob("*.whl")),
+    ],
+    check=True,
+)
+subprocess.run(
+    [
+        sys.executable, "-m", "pip", "install", "-q", "--no-deps",
+        "--force-reinstall", str(plugin_wheel),
     ],
     check=True,
 )
@@ -171,77 +115,103 @@ subprocess.run(
     check=True,
 )
 
+commit_file = next(INPUT.rglob("commit.txt"))
 print("project:", PROJECT)
+print("commit:", commit_file.read_text().strip())
+print("source W4:", source_w4)
 print("competition data:", data_root)
-print("model:", model_dir)
-print("wheelhouse:", wheel_dir)
+print("NF4 plugin:", plugin_wheel.name)
 ```
 
-В комплектных `smoke.yaml` и `grpo.yaml` выбран официальный `subprocess`
-sandbox SWEGemma. Kaggle не предоставляет Docker daemon: с `sandbox: docker`
-rollout падает до старта model server, поэтому utilization GPU остаётся нулевой.
-
-Не фиксируйте номер версии wheelhouse в коде: организаторы обновляют его.
-Используется именно версия dataset, подключённая к notebook.
-
-## Ячейка 2: проверить четыре GPU и окружение
+## Ячейка 2 — выбрать или один раз создать NF4 checkpoint
 
 ```python
-import os
 import torch
 
-print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
-print("GPU count:", torch.cuda.device_count())
-for index in range(torch.cuda.device_count()):
+assert torch.cuda.device_count() == 4, torch.cuda.device_count()
+for index in range(4):
     props = torch.cuda.get_device_properties(index)
     print(index, props.name, round(props.total_memory / 2**30, 1), "GiB")
-assert torch.cuda.device_count() == 4, "Notebook запущен не на L4 x4"
+
+def is_nf4(path):
+    try:
+        config = json.loads((path / "config.json").read_text())
+        quant = config.get("quantization_config") or {}
+        return (
+            str(quant.get("quant_method", "")).startswith("bitsandbytes")
+            and quant.get("load_in_4bit") is True
+            and quant.get("bnb_4bit_quant_type") == "nf4"
+            and str(quant.get("bnb_4bit_quant_storage")) in {"bfloat16", "torch.bfloat16"}
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+mounted_nf4 = [path.parent for path in INPUT.rglob("config.json") if is_nf4(path.parent)]
+NF4_DIR = mounted_nf4[0] if mounted_nf4 else Path(
+    "/kaggle/working/models/gemma-4-31b-nf4"
+)
+
+if not is_nf4(NF4_DIR):
+    subprocess.run(
+        [
+            "gemma-grpo", "convert-nf4",
+            "--source-model", str(source_w4),
+            "--output-dir", str(NF4_DIR),
+        ],
+        check=True,
+        cwd=PROJECT,
+    )
+
+print("persistent NF4 checkpoint:", NF4_DIR)
 ```
+
+Это единственное место, где исходный W4 распаковывается и переквантуется.
+Конвертация требует системную RAM и использует GPU 0 только как scratch. После
+этого и vLLM, и FSDP читают уже сохранённый NF4. Сохраните `NF4_DIR` как output
+первой notebook version и подключайте его как input в следующих сессиях.
+
+## Ячейка 3 — preflight
 
 ```python
 subprocess.run(
     [
         "gemma-grpo", "preflight",
-        "--config", str(PROJECT / "configs/grpo.yaml"),
+        "--config", str(PROJECT / "configs/smoke.yaml"),
         "--tasks", str(data_root / "tasks.jsonl"),
         "--snapshots-dir", str(data_root / "snapshots"),
         "--submission-dir", str(PROJECT / "submission"),
-        "--model-path", str(model_dir),
+        "--model-path", str(NF4_DIR),
     ],
     check=True,
+    cwd=PROJECT,
 )
 ```
 
-## Ячейка 3: выбрать задачи
+Preflight должен подтвердить `vllm-bnb-plugin`, BNB ≥0.48.1, сохранённый NF4
+с BF16 quant storage и четыре CUDA device. При любой красной проверке 31B не
+запускайте.
 
-Сначала посмотрите доступные идентификаторы и выберите несколько задач, а не
-все 129 сразу.
+## Ячейка 4 — обязательный smoke
 
 ```python
-import json
-
-tasks = [json.loads(line) for line in (data_root / "tasks.jsonl").read_text().splitlines()]
+tasks = [
+    json.loads(line)
+    for line in (data_root / "tasks.jsonl").read_text().splitlines()
+]
 [(row["instance_id"], row["repo"]) for row in tasks[:30]]
 ```
 
 ```python
-TASK_IDS = [
-    "REPLACE_WITH_REAL_TASK_ID_1",
-    "REPLACE_WITH_REAL_TASK_ID_2",
-]
-```
+TASK_IDS = ["requests_7505"]
+smoke_dir = Path("/kaggle/working/runs/smoke-fsdp-v1")
 
-## Ячейка 4: обязательный smoke test
-
-```python
-smoke_dir = Path("/kaggle/working/runs/smoke-v2")
 command = [
     "gemma-grpo", "loop",
     "--config", str(PROJECT / "configs/smoke.yaml"),
     "--tasks", str(data_root / "tasks.jsonl"),
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
-    "--model-path", str(model_dir),
+    "--model-path", str(NF4_DIR),
     "--task-id", TASK_IDS[0],
     "--work-dir", str(smoke_dir),
     "--target-steps", "1",
@@ -252,8 +222,19 @@ if (smoke_dir / "loop_state.json").exists():
 subprocess.run(command, check=True, cwd=PROJECT)
 ```
 
-Каждый `train` внутри loop печатает строки `[monitor]` и сохраняет полный JSONL
-рядом с adapter directory. После smoke найдите последний файл и получите сводку:
+Ожидаемая последовательность лога:
+
+```text
+[vllm] starting NF4 server
+[vllm] NF4 server ready
+[loop] collection ...
+[vllm] stopped; GPUs released for FSDP
+[train] launching FSDP-QLoRA on 4 GPUs
+```
+
+В группе теперь четыре seed: один rollout попадает на один FSDP rank. В
+training telemetry должны одновременно появляться все четыре GPU, а не прежняя
+пила последовательного `device_map`.
 
 ```python
 telemetry = max(
@@ -268,28 +249,14 @@ subprocess.run(
 print("raw telemetry:", telemetry)
 ```
 
-Если train упадёт, telemetry всё равно заканчивается фазой `failed`. Для текущего
-model-parallel режима нормально видеть последовательные пики GPU 0→1→2→3;
-ненормально — CPU/disk offload, VRAM вплотную к 22 GiB или отсутствие активности
-у GPU, которому device map назначил decoder layers.
-
-## Ячейка 5: непрерывный запуск до 100 optimizer steps
-
-Эта ячейка допустима только если подключённая версия harness сама завершает
-свой model server после каждого `swegemma eval`. Она **не** управляет сервером,
-который вы вручную создали через `adk_submission` и указали в local
-`models.yaml`; оставленный процесс на `127.0.0.1:8000` вызовет OOM при backward.
-Для такого режима сначала нужен managed server lifecycle (см. основной аудит).
+## Ячейка 5 — непрерывный run
 
 ```python
-run_dir = Path("/kaggle/working/runs/grpo-001")
-
-# Если к новой версии подключён output предыдущего run, восстановить checkpoint.
-previous_checkpoints = list(INPUT.rglob("grpo-001-checkpoint.zip"))
-if previous_checkpoints and not (run_dir / "loop_state.json").exists():
-    run_dir.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(previous_checkpoints[0]) as archive:
-        archive.extractall(run_dir.parent)
+TASK_IDS = [
+    "REPLACE_WITH_REAL_TASK_ID_1",
+    "REPLACE_WITH_REAL_TASK_ID_2",
+]
+run_dir = Path("/kaggle/working/runs/grpo-fsdp-001")
 
 command = [
     "gemma-grpo", "loop",
@@ -297,47 +264,24 @@ command = [
     "--tasks", str(data_root / "tasks.jsonl"),
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
-    "--model-path", str(model_dir),
+    "--model-path", str(NF4_DIR),
     "--work-dir", str(run_dir),
     "--target-steps", "100",
-    "--max-collections", "100",
+    "--max-collections", "200",
 ]
 for task_id in TASK_IDS:
     command.extend(["--task-id", task_id])
-
-# Если есть предварительно обученный SFT adapter:
-# command.extend(["--initial-adapter", "/kaggle/input/MY-SFT-DATASET/adapter"])
-
 if (run_dir / "loop_state.json").exists():
     command.append("--resume")
 
 subprocess.run(command, check=True, cwd=PROJECT)
 ```
 
-Один процесс сам чередует rollout и backward. Вкладку можно закрыть, если
-ноутбук запущен через Save Version / Save & Run All. Один Kaggle GPU run имеет
-ограничение 12 часов, поэтому 100 steps могут не поместиться в одну сессию.
-После каждого train-update состояние лежит в `loop_state.json`, а текущий LoRA
-adapter — в `runs/grpo-001/adapters/`.
+Не передавайте `--models-yaml`: managed loop сам владеет сервером. Kaggle run
+ограничен 12 часами, поэтому разумно сначала ставить cumulative target 10,
+сохранять `/kaggle/working/runs/grpo-fsdp-001`, затем продолжать с `--resume`.
 
-Для первого фонового `Save & Run All` разумнее поставить `--target-steps 10`.
-В следующей версии подключите output предыдущей версии и увеличьте cumulative
-target до `20`, затем до `30` и так далее. Это не ручное чередование
-collect/train: ограничение связано только с 12-часовой границей Kaggle.
-
-Сохраните resume-checkpoint как notebook output:
-
-```python
-checkpoint_zip = shutil.make_archive(
-    "/kaggle/working/grpo-001-checkpoint",
-    "zip",
-    root_dir=run_dir.parent,
-    base_dir=run_dir.name,
-)
-print(checkpoint_zip)
-```
-
-## Ячейка 6: собрать submission.zip
+## Ячейка 6 — export
 
 ```python
 state = json.loads((run_dir / "loop_state.json").read_text())
@@ -355,10 +299,10 @@ subprocess.run(
     check=True,
     cwd=PROJECT,
 )
-print(submission_zip, submission_zip.stat().st_size / 2**20, "MiB")
+print(submission_zip, round(submission_zip.stat().st_size / 2**20, 1), "MiB")
 ```
 
-Перед отправкой сохраните notebook version вместе с output. Для продолжения в
-новой 12-часовой сессии подключите output предыдущей версии как input, скопируйте
-папку `runs/grpo-001` обратно в `/kaggle/working/runs/grpo-001` и запустите ту же
-команду: `--resume` добавится автоматически.
+Перед submission отдельно проверьте adapter с официальным W4 base: competition
+evaluator использует W4, тогда как on-policy train/rollout теперь согласованы на
+NF4. Совместимость имён LoRA-модулей сохраняется, но logits двух base formats не
+bit-exact.

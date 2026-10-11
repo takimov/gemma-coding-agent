@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import inspect
 import json
+import os
 import random
 from collections import Counter
 from contextlib import nullcontext
@@ -11,77 +11,11 @@ from typing import Any
 from .config import ExperimentConfig
 from .groups import add_group_advantages, trainable_groups
 from .monitoring import TrainingMonitor
+from .nf4 import assert_nf4_checkpoint
 from .objective import grpo_loss
 from .policy import adapter_fingerprint
 from .tasks import read_jsonl
 from .tokenization import TokenizedTrajectory, assert_prefix_preserving, tokenize_trajectory
-
-
-def _requantize_linears_to_bnb4(model: Any, compute_dtype: Any) -> Any:
-    """Convert a dense CPU model to bitsandbytes NF4 one Linear at a time.
-
-    The source compressed-tensors checkpoint must first be dequantized on CPU.
-    Each dense layer is then quantized on a scratch GPU and immediately moved
-    back to CPU, so neither GPU nor system RAM needs a second full model copy.
-    """
-    import gc
-
-    import bitsandbytes as bnb
-    import torch
-    from tqdm.auto import tqdm
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("Requantizing compressed-tensors to bnb4 requires a CUDA GPU")
-
-    output_layer = model.get_output_embeddings()
-    linear_names = [
-        name
-        for name, module in model.named_modules()
-        if name
-        and isinstance(module, torch.nn.Linear)
-        and not isinstance(module, bnb.nn.Linear4bit)
-        and module is not output_layer
-    ]
-    scratch_device = torch.device("cuda:0")
-    for index, name in enumerate(tqdm(linear_names, desc="Requantizing linears to NF4")):
-        parent_name, _, child_name = name.rpartition(".")
-        parent = model.get_submodule(parent_name) if parent_name else model
-        old = getattr(parent, child_name)
-        new = bnb.nn.Linear4bit(
-            old.in_features,
-            old.out_features,
-            bias=old.bias is not None,
-            compute_dtype=compute_dtype,
-            compress_statistics=True,
-            quant_type="nf4",
-            quant_storage=torch.uint8,
-            device="cpu",
-        )
-        new.weight = bnb.nn.Params4bit(
-            old.weight.detach(),
-            requires_grad=False,
-            compress_statistics=True,
-            quant_type="nf4",
-            quant_storage=torch.uint8,
-            module=new,
-        )
-        if old.bias is not None:
-            new.bias = torch.nn.Parameter(old.bias.detach(), requires_grad=False)
-        new.requires_grad_(False)
-        # Params4bit performs the actual quantization on the first CUDA move.
-        new = new.to(scratch_device)
-        new = new.to("cpu")
-        setattr(parent, child_name, new)
-        del old, new
-        if (index + 1) % 32 == 0:
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    model.is_loaded_in_4bit = True
-    model.is_quantized = True
-    return model
 
 
 def _no_split_module_classes(model: Any) -> list[str] | None:
@@ -130,15 +64,11 @@ def _load_model_and_tokenizer(
     *,
     tokenizer: Any | None = None,
     monitor: TrainingMonitor | None = None,
+    fsdp: bool = False,
 ):
     import torch
     from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-    from transformers import (
-        AutoConfig,
-        AutoModelForCausalLM,
-        BitsAndBytesConfig,
-        CompressedTensorsConfig,
-    )
+    from transformers import AutoModelForCausalLM
 
     path = model_path or config.model.name_or_path
 
@@ -151,77 +81,33 @@ def _load_model_and_tokenizer(
         tokenizer = _load_tokenizer(config, model_path)
 
     dtype = getattr(torch, config.model.torch_dtype)
-    checkpoint_config = AutoConfig.from_pretrained(
-        path,
-        trust_remote_code=config.model.trust_remote_code,
-    )
-    checkpoint_quantization = getattr(checkpoint_config, "quantization_config", None)
-    checkpoint_quant_method = (
-        checkpoint_quantization.get("quant_method")
-        if isinstance(checkpoint_quantization, dict)
-        else getattr(checkpoint_quantization, "quant_method", None)
-    )
-    requantize_compressed_to_bnb4 = (
-        checkpoint_quant_method == "compressed-tensors"
-        and config.model.load_mode == "bnb4"
-    )
-    stage_compressed_on_cpu = (
-        checkpoint_quant_method == "compressed-tensors"
-        and torch.cuda.is_available()
-        and config.model.device_map not in (None, "cpu")
-    )
+    if config.model.load_mode == "nf4":
+        assert_nf4_checkpoint(path, require_fsdp_storage=fsdp)
     load_kwargs: dict[str, Any] = {
-        "device_map": "cpu" if stage_compressed_on_cpu else config.model.device_map,
         "trust_remote_code": config.model.trust_remote_code,
         "dtype": dtype,
         "low_cpu_mem_usage": True,
     }
-    if (
-        not stage_compressed_on_cpu
-        and config.model.max_memory_per_gpu_gib is not None
-        and torch.cuda.is_available()
-    ):
-        load_kwargs["max_memory"] = {
-            index: f"{config.model.max_memory_per_gpu_gib}GiB"
-            for index in range(torch.cuda.device_count())
-        }
-    if config.model.load_mode == "bnb4" and not requantize_compressed_to_bnb4:
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-    elif checkpoint_quant_method == "compressed-tensors":
-        # Packed compressed-tensors checkpoints do not expose ``weight`` until
-        # decompression. PEFT injects LoRA before the first forward and therefore
-        # cannot wrap those packed Linear modules. Decompress during loading so
-        # device-map placement sees the real bf16 sizes and PEFT receives ordinary
-        # Linear layers. The dense base is frozen immediately after LoRA injection.
-        compressed_parameters = inspect.signature(CompressedTensorsConfig).parameters
-        if "dequantize" in compressed_parameters:
-            load_kwargs["quantization_config"] = CompressedTensorsConfig(dequantize=True)
-        else:
-            # Transformers <=4.x exposes the same behavior under the legacy
-            # loading attribute: run_compressed=False means dequantize on load.
-            load_kwargs["quantization_config"] = CompressedTensorsConfig(
-                run_compressed=False
-            )
-    phase("load_checkpoint_cpu" if stage_compressed_on_cpu else "load_checkpoint")
+    if not fsdp and config.model.device_map is not None:
+        load_kwargs["device_map"] = config.model.device_map
+    phase("load_nf4_checkpoint" if config.model.load_mode == "nf4" else "load_checkpoint")
     model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
-    if requantize_compressed_to_bnb4:
-        phase("requantize_nf4")
-        print("[train] converting decompressed CPU model to bitsandbytes NF4")
-        model = _requantize_linears_to_bnb4(model, dtype)
-        model.config.quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        ).to_dict()
-    if config.model.load_mode == "bnb4":
+    if config.model.load_mode == "nf4":
+        if not bool(getattr(model, "is_loaded_in_4bit", False)):
+            raise RuntimeError("Saved NF4 checkpoint was not loaded as a 4-bit model")
         phase("prepare_kbit")
         model = prepare_model_for_kbit_training(model)
+        # PEFT intentionally promotes non-quantized parameters to FP32. Gemma's
+        # tied 262k-token embedding/lm_head would then consume about 5.6 GiB on
+        # every FSDP rank. It is frozen, so keep that shared tensor in BF16 to
+        # match the NF4 storage/compute dtype and halve the replicated cost.
+        projection_modules = {
+            id(module): module
+            for module in (model.get_input_embeddings(), model.get_output_embeddings())
+            if module is not None
+        }
+        for module in projection_modules.values():
+            module.to(dtype=dtype)
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -242,61 +128,6 @@ def _load_model_and_tokenizer(
                 bias="none",
             ),
         )
-    if stage_compressed_on_cpu:
-        from accelerate import dispatch_model, infer_auto_device_map
-        from accelerate.utils import get_balanced_memory
-
-        # Decompression needs a packed tensor, a temporary unpacked tensor, and
-        # the final bf16 tensor at the same time. Staging on CPU avoids that VRAM
-        # peak. In bnb4 mode the dense layers are then requantized one at a time,
-        # before dispatch. GPU 0 owns the embeddings/lm_head and receives every
-        # vocabulary projection, so it needs more activation headroom than the
-        # GPUs which only own decoder blocks.
-        max_memory: dict[int | str, str] = {}
-        for index in range(torch.cuda.device_count()):
-            physical_gib = torch.cuda.get_device_properties(index).total_memory // (1024**3)
-            reserve_gib = (
-                config.model.gpu0_reserve_gib
-                if index == 0
-                else config.model.other_gpu_reserve_gib
-            )
-            if reserve_gib >= physical_gib:
-                raise ValueError(
-                    f"GPU {index} reserve ({reserve_gib} GiB) must be smaller than "
-                    f"its physical memory ({physical_gib} GiB)"
-                )
-            requested_gib = config.model.max_memory_per_gpu_gib or physical_gib
-            weight_budget_gib = min(requested_gib, physical_gib - reserve_gib)
-            max_memory[index] = f"{weight_budget_gib}GiB"
-        print(f"[train] GPU weight-memory budgets: {max_memory}", flush=True)
-        max_memory["cpu"] = "150GiB"
-        phase("infer_device_map")
-        no_split = _no_split_module_classes(model)
-        balanced_memory = get_balanced_memory(
-            model,
-            max_memory=max_memory,
-            no_split_module_classes=no_split,
-            dtype=dtype,
-        )
-        device_map = infer_auto_device_map(
-            model,
-            max_memory=balanced_memory,
-            no_split_module_classes=no_split,
-            dtype=dtype,
-        )
-        offloaded = sorted(
-            name
-            for name, device in device_map.items()
-            if str(device) in {"cpu", "disk"}
-        )
-        if offloaded:
-            raise RuntimeError(
-                "The decompressed base does not fit in the configured GPU memory; "
-                f"CPU/disk assignments include: {offloaded[:5]}"
-            )
-        print(f"[train] dispatching decompressed model with device map: {device_map}")
-        phase("dispatch_model")
-        model = dispatch_model(model, device_map=device_map)
     return model, tokenizer
 
 
@@ -361,18 +192,74 @@ def _project_action_logprobs(
     return torch.cat(chunks, dim=1).squeeze(0)
 
 
+def _build_selective_logprob_model(policy: Any, *, chunk_size: int):
+    """Wrap the complete selective-logprob path in one FSDP-visible forward.
+
+    Keeping the vocabulary projection loop inside the root forward ensures the
+    large tied lm_head is all-gathered once per trajectory instead of once per
+    logit chunk.
+    """
+    import torch
+
+    class SelectiveLogprobModel(torch.nn.Module):
+        def __init__(self, wrapped_policy: Any, projection_chunk_size: int) -> None:
+            super().__init__()
+            self.policy = wrapped_policy
+            self.chunk_size = projection_chunk_size
+            self._gemma_grpo_selective_logprobs = True
+
+        def forward(self, input_ids, target_positions):
+            backbone, output_head, softcap = _causal_lm_parts(self.policy)
+            outputs = backbone(input_ids=input_ids, use_cache=False)
+            hidden_states = outputs.last_hidden_state
+            logit_positions = (target_positions - 1).to(hidden_states.device)
+            selected_hidden = hidden_states.index_select(1, logit_positions)
+            labels = input_ids.index_select(1, target_positions.to(input_ids.device))
+            return _project_action_logprobs(
+                output_head,
+                selected_hidden,
+                labels,
+                chunk_size=self.chunk_size,
+                final_logit_softcapping=softcap,
+            )
+
+    return SelectiveLogprobModel(policy, chunk_size)
+
+
+def _wrapped_policy(model: Any) -> Any:
+    return model.policy if hasattr(model, "policy") else model
+
+
+def _is_selective_logprob_model(model: Any) -> bool:
+    if bool(getattr(model, "_gemma_grpo_selective_logprobs", False)):
+        return True
+    wrapped = getattr(model, "module", None)
+    return bool(getattr(wrapped, "_gemma_grpo_selective_logprobs", False))
+
+
 def _selected_logprobs(
     model: Any,
     tokenized: TokenizedTrajectory,
     *,
     chunk_size: int,
+    input_device: Any | None = None,
 ):
     import torch
 
-    input_device = _embedding_device(model)
-    input_ids = torch.tensor([tokenized.input_ids], dtype=torch.long, device=input_device)
+    if _is_selective_logprob_model(model):
+        device = input_device
+        if device is None:
+            device = next(model.parameters()).device
+        input_ids = torch.tensor([tokenized.input_ids], dtype=torch.long, device=device)
+        target_positions = torch.tensor(
+            tokenized.action_positions, dtype=torch.long, device=device
+        )
+        return model(input_ids=input_ids, target_positions=target_positions)
+
+    device = input_device or _embedding_device(model)
+    input_ids = torch.tensor([tokenized.input_ids], dtype=torch.long, device=device)
     target_positions = torch.tensor(
-        tokenized.action_positions, dtype=torch.long, device=input_device
+        tokenized.action_positions, dtype=torch.long, device=device
     )
     backbone, output_head, final_logit_softcapping = _causal_lm_parts(model)
     outputs = backbone(input_ids=input_ids, use_cache=False)
@@ -394,12 +281,73 @@ def _rollout_logprobs(
     segments: list[TokenizedTrajectory],
     *,
     chunk_size: int,
+    input_device: Any | None = None,
 ):
     import torch
 
     return torch.cat(
-        [_selected_logprobs(model, segment, chunk_size=chunk_size) for segment in segments]
+        [
+            _selected_logprobs(
+                model,
+                segment,
+                chunk_size=chunk_size,
+                input_device=input_device,
+            )
+            for segment in segments
+        ]
     )
+
+
+def _distributed_rollout_logprobs(
+    model: Any,
+    segments: list[TokenizedTrajectory],
+    *,
+    chunk_size: int,
+    input_device: Any,
+    world_size: int,
+    dummy_token_id: int,
+):
+    """Score a rollout while keeping FSDP forward counts equal on every rank.
+
+    Exact ATIF traces contain one segment per assistant call, and different
+    trajectories can contain different numbers of calls. FSDP collectives
+    deadlock if one rank enters the wrapped decoder more often than another.
+    Short ranks therefore execute tiny two-token padding forwards. The returned
+    zero-valued anchor must be included in the training loss so autograd also
+    traverses those padding forwards during backward.
+    """
+    import torch
+
+    maximum = len(segments)
+    if world_size > 1:
+        count = torch.tensor(maximum, dtype=torch.int64, device=input_device)
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX)
+        maximum = int(count.item())
+    if maximum < 1:
+        raise ValueError("A rollout must contain at least one token segment")
+
+    padded = list(segments)
+    padded.extend(
+        TokenizedTrajectory(
+            input_ids=[dummy_token_id, dummy_token_id],
+            action_positions=[1],
+        )
+        for _ in range(maximum - len(segments))
+    )
+    outputs = [
+        _selected_logprobs(
+            model,
+            segment,
+            chunk_size=chunk_size,
+            input_device=input_device,
+        )
+        for segment in padded
+    ]
+    real_count = sum(len(segment.action_positions) for segment in segments)
+    combined = torch.cat(outputs)
+    real = combined[:real_count]
+    padding_anchor = combined[real_count:].sum() * 0.0
+    return real, padding_anchor
 
 
 def _validate_trajectory(trajectory: TokenizedTrajectory) -> TokenizedTrajectory:
@@ -440,8 +388,23 @@ def _row_segments(tokenizer: Any, row: dict[str, Any]) -> list[TokenizedTrajecto
 
 
 def _disable_adapter(model: Any):
-    method = getattr(model, "disable_adapter", None)
+    method = getattr(_wrapped_policy(model), "disable_adapter", None)
     return method() if method is not None else nullcontext()
+
+
+def _policy_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Strip the selective-logprob wrapper prefix from a gathered state dict."""
+    prefixes = ("policy.", "module.policy.", "_fsdp_wrapped_module.policy.")
+    result: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        matched = next((prefix for prefix in prefixes if key.startswith(prefix)), None)
+        if matched is not None:
+            result[key[len(matched) :]] = value
+    if not result:
+        raise RuntimeError(
+            "Gathered FSDP state dict does not contain the selective model's policy prefix"
+        )
+    return result
 
 
 def _next_telemetry_path(output_dir: Path) -> Path:
@@ -453,6 +416,163 @@ def _next_telemetry_path(output_dir: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"Could not allocate a telemetry filename next to {output_dir}")
+
+
+class _NullMonitor:
+    def set_phase(self, phase: str) -> None:
+        del phase
+
+
+def _create_accelerator(config: ExperimentConfig):
+    from accelerate import Accelerator
+
+    if config.distributed.strategy != "fsdp":
+        return Accelerator(mixed_precision="no"), None
+
+    from accelerate import FullyShardedDataParallelPlugin
+    from accelerate.utils import enable_fsdp_ram_efficient_loading
+    from torch.distributed.fsdp import BackwardPrefetch, ShardingStrategy, StateDictType
+
+    enable_fsdp_ram_efficient_loading()
+    plugin = FullyShardedDataParallelPlugin(
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        cpu_offload=config.distributed.cpu_offload,
+        state_dict_type=StateDictType.SHARDED_STATE_DICT,
+        limit_all_gathers=config.distributed.limit_all_gathers,
+        use_orig_params=False,
+        sync_module_states=True,
+        cpu_ram_efficient_loading=True,
+    )
+    return Accelerator(mixed_precision="no", fsdp_plugin=plugin), plugin
+
+
+def _prepare_replicated_projection_modules(policy: Any, accelerator: Any, fsdp_plugin: Any):
+    """Keep tied embeddings/lm_head replicated for checkpointed chunk recompute.
+
+    Transformer gradient checkpointing re-enters decoder FSDP units through
+    their own forwards. The chunked vocabulary projection is checkpointed below
+    the root wrapper, so its tied weight must remain materialized through
+    backward. Replicating this one BF16 tensor costs roughly 2.8 GiB per L4 and
+    avoids an all-gather for every 32-token vocabulary chunk.
+    """
+    import torch
+
+    input_module = policy.get_input_embeddings()
+    output_module = policy.get_output_embeddings()
+    if input_module is None or output_module is None:
+        raise RuntimeError("FSDP policy must expose input and output embeddings")
+    tied = getattr(input_module, "weight", None) is getattr(output_module, "weight", None)
+    modules = [input_module]
+    if output_module is not input_module:
+        modules.append(output_module)
+    ignored_trainable = [
+        name
+        for module in modules
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
+    ]
+    if ignored_trainable:
+        raise RuntimeError(
+            "The replicated embedding/lm_head contains trainable parameters that FSDP "
+            f"would not reduce: {ignored_trainable}. Exclude the output head from LoRA."
+        )
+    fsdp_plugin.ignored_modules = modules
+
+    if accelerator.is_main_process:
+        input_module.to(accelerator.device)
+        if not tied and output_module is not input_module:
+            output_module.to(accelerator.device)
+    else:
+        input_module.to_empty(device=accelerator.device, recurse=False)
+        if tied:
+            output_module.weight = input_module.weight
+            bias = getattr(output_module, "bias", None)
+            if bias is not None and getattr(bias, "is_meta", False):
+                output_module.bias = torch.nn.Parameter(
+                    torch.empty_like(bias, device=accelerator.device),
+                    requires_grad=bias.requires_grad,
+                )
+        elif output_module is not input_module:
+            output_module.to_empty(device=accelerator.device, recurse=False)
+    return modules
+
+
+def _broadcast_replicated_modules(modules: list[Any]) -> None:
+    import torch.distributed as dist
+
+    seen: set[int] = set()
+    for module in modules:
+        for parameter in module.parameters(recurse=False):
+            if id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
+            dist.broadcast(parameter.data, src=0)
+        for buffer in module.buffers(recurse=False):
+            if id(buffer) in seen:
+                continue
+            seen.add(id(buffer))
+            dist.broadcast(buffer.data, src=0)
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _fsdp_worker_entry(
+    local_rank: int,
+    world_size: int,
+    master_port: int,
+    config: ExperimentConfig,
+    rollout_paths: list[Path],
+    output_dir: Path,
+    model_path: str | None,
+    resume_adapter: Path | None,
+    telemetry_path: Path,
+) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+    os.environ["NODE_RANK"] = "0"
+    os.environ["ACCELERATE_USE_FSDP"] = "true"
+    os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
+
+    import torch
+
+    torch.cuda.set_device(local_rank)
+
+    if local_rank == 0:
+        with TrainingMonitor(
+            telemetry_path,
+            interval_seconds=config.grpo.monitor_interval_seconds,
+            console_seconds=config.grpo.monitor_console_seconds,
+        ) as monitor:
+            _train_adapter_impl(
+                config=config,
+                rollout_paths=rollout_paths,
+                output_dir=output_dir,
+                model_path=model_path,
+                resume_adapter=resume_adapter,
+                monitor=monitor,
+                telemetry_path=telemetry_path,
+            )
+    else:
+        _train_adapter_impl(
+            config=config,
+            rollout_paths=rollout_paths,
+            output_dir=output_dir,
+            model_path=model_path,
+            resume_adapter=resume_adapter,
+            monitor=_NullMonitor(),
+            telemetry_path=telemetry_path,
+        )
 
 
 def train_adapter(
@@ -467,6 +587,41 @@ def train_adapter(
         raise FileExistsError(f"Refusing to overwrite non-empty adapter directory {output_dir}")
     telemetry_path = _next_telemetry_path(output_dir)
     print(f"[train] telemetry: {telemetry_path}", flush=True)
+    if config.distributed.strategy == "fsdp" and int(os.environ.get("WORLD_SIZE", "1")) == 1:
+        import torch.multiprocessing as mp
+
+        if not __import__("torch").cuda.is_available():
+            raise RuntimeError("FSDP-QLoRA requires CUDA")
+        visible_gpus = __import__("torch").cuda.device_count()
+        if visible_gpus < config.distributed.num_processes:
+            raise RuntimeError(
+                f"FSDP requested {config.distributed.num_processes} processes but only "
+                f"{visible_gpus} CUDA devices are visible"
+            )
+        print(
+            f"[train] launching FSDP-QLoRA on {config.distributed.num_processes} GPUs",
+            flush=True,
+        )
+        mp.spawn(
+            _fsdp_worker_entry,
+            args=(
+                config.distributed.num_processes,
+                _free_port(),
+                config,
+                rollout_paths,
+                output_dir,
+                model_path,
+                resume_adapter,
+                telemetry_path,
+            ),
+            nprocs=config.distributed.num_processes,
+            join=True,
+        )
+        metrics_path = output_dir / "training_metrics.json"
+        if not metrics_path.is_file():
+            raise RuntimeError("FSDP workers exited without writing training_metrics.json")
+        return json.loads(metrics_path.read_text(encoding="utf-8"))
+
     with TrainingMonitor(
         telemetry_path,
         interval_seconds=config.grpo.monitor_interval_seconds,
@@ -495,6 +650,17 @@ def _train_adapter_impl(
 ) -> dict[str, Any]:
     import torch
 
+    accelerator, fsdp_plugin = _create_accelerator(config)
+    world_size = accelerator.num_processes
+    rank = accelerator.process_index
+    if config.distributed.strategy == "fsdp":
+        if world_size != config.distributed.num_processes:
+            raise RuntimeError(
+                f"FSDP world size is {world_size}, expected {config.distributed.num_processes}"
+            )
+    elif world_size != 1:
+        raise RuntimeError("distributed.strategy=none must run in one process")
+
     random.seed(config.grpo.seed)
     torch.manual_seed(config.grpo.seed)
 
@@ -520,8 +686,7 @@ def _train_adapter_impl(
     group_items = list(groups.items())
     random.shuffle(group_items)
 
-    # Tokenize and reject unusable groups before paying the five-minute model
-    # load/requantization cost.
+    # Tokenize and reject unusable groups before paying the model-load cost.
     monitor.set_phase("tokenize_rollouts")
     tokenizer = _load_tokenizer(config, model_path)
     metrics: list[dict[str, Any]] = []
@@ -535,11 +700,12 @@ def _train_adapter_impl(
             segments = _row_segments(tokenizer, row)
             lengths = [len(segment.input_ids) for segment in segments]
             action_tokens = sum(len(segment.action_positions) for segment in segments)
-            print(
-                f"[train] trajectory group={group_id} seed={row.get('seed')} "
-                f"segments={len(segments)} lengths={lengths} actions={action_tokens}",
-                flush=True,
-            )
+            if accelerator.is_main_process:
+                print(
+                    f"[train] trajectory group={group_id} seed={row.get('seed')} "
+                    f"segments={len(segments)} lengths={lengths} actions={action_tokens}",
+                    flush=True,
+                )
             if any(len(segment.input_ids) > config.grpo.max_seq_length for segment in segments):
                 oversized.append({"seed": row.get("seed"), "lengths": lengths})
             prepared.append((row, segments))
@@ -578,6 +744,7 @@ def _train_adapter_impl(
         resume_adapter,
         tokenizer=tokenizer,
         monitor=monitor,
+        fsdp=config.distributed.strategy == "fsdp",
     )
     nonzero_dropouts = [
         module for module in model.modules() if isinstance(module, torch.nn.Dropout) and module.p > 0
@@ -587,6 +754,22 @@ def _train_adapter_impl(
             "The loaded policy contains non-zero dropout, so cached old/new policy log-probabilities "
             "would not be deterministic. Train/export an adapter with dropout=0."
         )
+    policy = model
+    model = _build_selective_logprob_model(
+        policy,
+        chunk_size=config.grpo.logprob_chunk_size,
+    )
+    replicated_modules: list[Any] = []
+    if fsdp_plugin is not None:
+        from peft.utils.other import fsdp_auto_wrap_policy
+
+        fsdp_plugin.auto_wrap_policy = fsdp_auto_wrap_policy(policy)
+        replicated_modules = _prepare_replicated_projection_modules(
+            policy,
+            accelerator,
+            fsdp_plugin,
+        )
+
     model.train()
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_parameters:
@@ -594,7 +777,17 @@ def _train_adapter_impl(
     monitor.set_phase("optimizer_init")
     optimizer = torch.optim.AdamW(trainable_parameters, lr=config.grpo.learning_rate)
     trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
-    print(f"[train] trainable parameters: {trainable_count:,}", flush=True)
+    monitor.set_phase("fsdp_wrap")
+    model, optimizer = accelerator.prepare(model, optimizer)
+    if replicated_modules:
+        _broadcast_replicated_modules(replicated_modules)
+        accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print(
+            f"[train] trainable parameters: {trainable_count:,}; "
+            f"world_size={world_size}; device={accelerator.device}",
+            flush=True,
+        )
 
     # Snapshot every behavior-policy and reference log-probability before the
     # first optimizer step. Recomputing old_logprobs between groups would make
@@ -612,25 +805,45 @@ def _train_adapter_impl(
             ],
         ]
     ] = []
+    dummy_token_id = tokenizer.eos_token_id
+    if dummy_token_id is None:
+        dummy_token_id = tokenizer.pad_token_id
+    if dummy_token_id is None:
+        dummy_token_id = 0
     model.eval()
     with torch.no_grad():
         for group_id, prepared in prepared_groups:
+            if len(prepared) % world_size:
+                raise ValueError(
+                    f"Group {group_id} has {len(prepared)} trajectories, which is not divisible "
+                    f"by FSDP world size {world_size}"
+                )
+            local_prepared = prepared[rank::world_size]
             cached_rollouts = []
-            for row, segments in prepared:
+            for row, segments in local_prepared:
                 seed = row.get("seed")
                 monitor.set_phase(f"cache_old:{group_id}:seed_{seed}")
-                old = _rollout_logprobs(
+                old, _ = _distributed_rollout_logprobs(
                     model,
                     segments,
                     chunk_size=config.grpo.logprob_chunk_size,
-                ).detach().cpu()
+                    input_device=accelerator.device,
+                    world_size=world_size,
+                    dummy_token_id=int(dummy_token_id),
+                )
+                old = old.detach().cpu()
                 monitor.set_phase(f"cache_reference:{group_id}:seed_{seed}")
-                with _disable_adapter(model):
-                    reference = _rollout_logprobs(
+                unwrapped = accelerator.unwrap_model(model)
+                with _disable_adapter(unwrapped):
+                    reference, _ = _distributed_rollout_logprobs(
                         model,
                         segments,
                         chunk_size=config.grpo.logprob_chunk_size,
-                    ).detach().cpu()
+                        input_device=accelerator.device,
+                        world_size=world_size,
+                        dummy_token_id=int(dummy_token_id),
+                    )
+                    reference = reference.detach().cpu()
                 cached_rollouts.append((row, segments, old, reference))
             cached_groups.append((group_id, cached_rollouts))
 
@@ -646,10 +859,13 @@ def _train_adapter_impl(
             for row, segments, old_cpu, reference_cpu in cached_rollouts:
                 seed = row.get("seed")
                 monitor.set_phase(f"forward_backward:{group_id}:seed_{seed}")
-                new = _rollout_logprobs(
+                new, padding_anchor = _distributed_rollout_logprobs(
                     model,
                     segments,
                     chunk_size=config.grpo.logprob_chunk_size,
+                    input_device=accelerator.device,
+                    world_size=world_size,
+                    dummy_token_id=int(dummy_token_id),
                 )
                 old = old_cpu.to(new.device)
                 reference = reference_cpu.to(new.device)
@@ -661,17 +877,18 @@ def _train_adapter_impl(
                     clip_epsilon=config.grpo.clip_epsilon,
                     beta=config.grpo.beta,
                 )
+                loss = loss + padding_anchor
                 if not bool(torch.isfinite(loss)) or not bool(torch.isfinite(kl)):
                     raise FloatingPointError(
                         f"Non-finite GRPO objective for group={group_id} seed={seed}: "
                         f"loss={float(loss.detach().cpu())}, kl={float(kl.detach().cpu())}"
                     )
-                (loss / len(cached_rollouts)).backward()
+                accelerator.backward(loss / len(cached_rollouts))
                 total_loss += float(loss.detach().cpu())
                 total_kl += float(kl.detach().cpu())
             monitor.set_phase(f"optimizer:{group_id}:epoch_{epoch}")
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters, config.grpo.max_grad_norm
+            grad_norm = accelerator.clip_grad_norm_(
+                model.parameters(), config.grpo.max_grad_norm
             )
             if not bool(torch.isfinite(grad_norm)):
                 raise FloatingPointError(
@@ -680,37 +897,64 @@ def _train_adapter_impl(
                 )
             optimizer.step()
             optimizer_step += 1
-            metrics.append(
-                {
-                    "optimizer_step": optimizer_step,
-                    "epoch": epoch,
-                    "group_id": group_id,
-                    "rollouts": len(cached_rollouts),
-                    "loss": total_loss / len(cached_rollouts),
-                    "kl": total_kl / len(cached_rollouts),
-                    "grad_norm": float(
-                        grad_norm.detach().cpu() if hasattr(grad_norm, "detach") else grad_norm
-                    ),
-                }
+            totals = torch.tensor(
+                [total_loss, total_kl, float(len(cached_rollouts))],
+                dtype=torch.float64,
+                device=accelerator.device,
             )
+            totals = accelerator.reduce(totals, reduction="sum")
+            if accelerator.is_main_process:
+                global_rollouts = int(totals[2].item())
+                metrics.append(
+                    {
+                        "optimizer_step": optimizer_step,
+                        "epoch": epoch,
+                        "group_id": group_id,
+                        "rollouts": global_rollouts,
+                        "loss": float(totals[0].item()) / global_rollouts,
+                        "kl": float(totals[1].item()) / global_rollouts,
+                        "grad_norm": float(
+                            grad_norm.detach().cpu()
+                            if hasattr(grad_norm, "detach")
+                            else grad_norm
+                        ),
+                    }
+                )
 
     if optimizer_step == 0:
         raise ValueError("No optimization step was executed; inspect sequence lengths and trace messages")
-    monitor.set_phase("save_adapter")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(output_dir, safe_serialization=True)
+    monitor.set_phase("gather_adapter")
+    accelerator.wait_for_everyone()
+    if fsdp_plugin is not None:
+        fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+    gathered_state = accelerator.get_state_dict(model)
+    if accelerator.is_main_process:
+        monitor.set_phase("save_adapter")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        unwrapped = accelerator.unwrap_model(model)
+        output_policy = _wrapped_policy(unwrapped)
+        output_policy.save_pretrained(
+            output_dir,
+            state_dict=_policy_state_dict(gathered_state),
+            safe_serialization=True,
+        )
     summary = {
         "groups_available": len(groups),
         "groups_processed": len(cached_groups),
         "optimizer_steps": optimizer_step,
         "trainable_parameters": trainable_count,
+        "distributed_strategy": config.distributed.strategy,
+        "world_size": world_size,
         "logprob_chunk_size": config.grpo.logprob_chunk_size,
         "telemetry_path": str(telemetry_path),
         "token_sources": dict(Counter(str(row.get("token_source", "unknown")) for row in source_rows)),
         "metrics": metrics,
     }
-    (output_dir / "training_metrics.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    if accelerator.is_main_process:
+        (output_dir / "training_metrics.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    accelerator.wait_for_everyone()
+    accelerator.end_training()
     return summary
 

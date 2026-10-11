@@ -10,10 +10,11 @@ def test_default_config_has_matching_group_and_seeds():
     assert config.grpo.group_size == 4
     assert len(config.rollout.seeds) == 4
     assert config.lora.r == 16
-    assert config.model.device_map == "balanced"
-    assert config.model.max_memory_per_gpu_gib == 22
-    assert config.model.gpu0_reserve_gib == 8
-    assert config.model.other_gpu_reserve_gib == 4
+    assert config.model.load_mode == "nf4"
+    assert config.model.device_map is None
+    assert config.distributed.strategy == "fsdp"
+    assert config.distributed.num_processes == 4
+    assert config.rollout.managed_vllm is True
     assert config.grpo.logprob_chunk_size == 32
     assert config.grpo.monitor_interval_seconds == 5
 
@@ -29,5 +30,20 @@ rollout: {seeds: [1, 2]}
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="group_size"):
+        load_config(path)
+
+
+def test_fsdp_requires_equal_work_per_rank(tmp_path):
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        """
+model: {name_or_path: model, load_mode: nf4, device_map: null}
+distributed: {strategy: fsdp, num_processes: 3}
+grpo: {group_size: 4}
+rollout: {seeds: [1, 2, 3, 4]}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="divisible"):
         load_config(path)
 
