@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemma-swegemma-grpo"
+version = "0.1.0"
+description = "Artifact-based GRPO/LoRA training loop for the Gemma 4 Developer Agent competition"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "PyYAML>=6.0.2",
+]
+
+[project.optional-dependencies]
+train = [
+  "accelerate>=1.10",
+  "bitsandbytes>=0.46",
+  "peft>=0.17",
+  "torch>=2.7",
+  "transformers>=5.0",
+]
+dev = [
+  "pytest>=8.4",
+]
+
+[project.scripts]
+gemma-grpo = "gemma_grpo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+

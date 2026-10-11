@@ -1,0 +1,40 @@
+model:
+  name_or_path: /path/to/model
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  # The competition compressed-tensors checkpoint is staged/decompressed on
+  # CPU and requantized layer-by-layer to trainable bitsandbytes NF4.
+  load_mode: bnb4
+  device_map: balanced
+  max_memory_per_gpu_gib: 22
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.0
+  target_modules: all-linear
+grpo:
+  learning_rate: 5.0e-6
+  beta: 0.01
+  clip_epsilon: 0.2
+  group_size: 2
+  epochs: 1
+  max_steps: 1
+  max_seq_length: 4096
+  max_grad_norm: 1.0
+  seed: 42
+rollout:
+  # Kaggle notebooks do not expose a Docker daemon. SWEGemma's subprocess
+  # sandbox provides the supported isolated runner for this environment.
+  sandbox: subprocess
+  image: null
+  concurrency: 1
+  max_tool_calls: 5
+  max_time_minutes: 5
+  timeout_seconds: null
+  seeds: [101, 202]
+reward:
+  resolved: 1.0
+  failed: 0.0
+  empty_patch: -0.25
+  tool_call_penalty: 0.0
+

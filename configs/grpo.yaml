@@ -1,0 +1,52 @@
+model:
+  # Override on Kaggle with --model-path. Keep the competition checkpoint and
+  # rollout server on exactly the same tokenizer/model revision.
+  name_or_path: /kaggle/input/gemma-4/pytorch/gemma-4-31b-it-qat-w4a16-ct/1
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  # Keep the frozen training base at 4-bit. For the competition
+  # compressed-tensors checkpoint the loader stages it on CPU and requantizes
+  # each Linear to trainable bitsandbytes NF4 before GPU dispatch.
+  load_mode: bnb4
+  # Spread the model across all four 24 GiB L4s instead of packing GPU 0.
+  device_map: balanced
+  max_memory_per_gpu_gib: 22
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: all-linear
+
+grpo:
+  learning_rate: 5.0e-6
+  beta: 0.01
+  clip_epsilon: 0.2
+  group_size: 4
+  epochs: 2
+  max_steps: null
+  max_seq_length: 32768
+  max_grad_norm: 1.0
+  seed: 42
+
+rollout:
+  # Kaggle notebooks do not expose a Docker daemon. SWEGemma's subprocess
+  # sandbox provides the supported isolated runner for this environment.
+  sandbox: subprocess
+  # null uses the image configured by the installed competition harness.
+  image: null
+  concurrency: 1
+  max_tool_calls: 20
+  max_time_minutes: 15
+  # Kept in submission/eval_config.yaml; null avoids relying on a version-specific CLI flag.
+  timeout_seconds: null
+  seeds: [101, 202, 303, 404]
+
+reward:
+  resolved: 1.0
+  failed: 0.0
+  empty_patch: -0.25
+  # Applied only to resolved trajectories, so all-failure groups do not learn
+  # merely to stop earlier.
+  tool_call_penalty: 0.002
+

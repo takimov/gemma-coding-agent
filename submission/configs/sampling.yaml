@@ -1,0 +1,8 @@
+temperature: 0.8
+top_p: 0.95
+seed: 101
+max_output_tokens: 16384
+thinking_config:
+  include_thoughts: true
+  thinking_budget: 4096
+
