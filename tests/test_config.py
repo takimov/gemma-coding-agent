@@ -40,7 +40,8 @@ def test_sft_config_uses_safe_offline_defaults():
     smoke = load_config(Path(__file__).parents[1] / "configs" / "sft-smoke.yaml")
     assert smoke.sft.max_steps == 1
     assert smoke.sft.epochs == 1
-    assert smoke.lora.r == 8
+    assert smoke.lora.r == config.lora.r
+    assert smoke.lora.alpha == config.lora.alpha
 
 
 def test_mismatched_group_size_is_rejected(tmp_path):

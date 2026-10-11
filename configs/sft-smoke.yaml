@@ -12,8 +12,10 @@ distributed:
   limit_all_gathers: true
 
 lora:
-  r: 8
-  alpha: 16
+  # Keep the adapter architecture identical to configs/sft.yaml so a successful
+  # one-step smoke can be resumed instead of discarded.
+  r: 16
+  alpha: 32
   dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   exclude_modules: '.*vision_tower.*'

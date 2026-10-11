@@ -303,9 +303,10 @@ print(json.loads((SFT_OUTPUT / "training_metrics.json").read_text()))
 
 Production-конфиг `configs/sft.yaml` использует две эпохи,
 `max_seq_length=8192`, LoRA rank 16 и не более двух уникальных траекторий с
-одной задачи. Готовый `configs/sft-smoke.yaml` делает ровно один step с rank 8;
-после успешного smoke создайте новый output directory и переключитесь на
-`configs/sft.yaml`.
+одной задачи. Готовый `configs/sft-smoke.yaml` делает ровно один step с той же
+LoRA-архитектурой. После успешного smoke можно либо начать чистый production
+run, либо передать smoke-adapter через `--resume-adapter` и продолжить в новом
+output directory с `configs/sft.yaml`.
 
 ## Ячейка 4 — обязательный smoke
 
