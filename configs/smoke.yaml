@@ -56,8 +56,8 @@ rollout:
   vllm_pipeline_parallel_size: 1
   # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
   vllm_language_model_only: true
-  # SWEGemma requests up to 16k completion tokens.  Keep rollout context
-  # independent from the smaller 8k training filter used by this smoke test.
+  # Keep rollout context independent from the smaller 8k training filter used
+  # by this smoke test. Submission turns reserve 4k for generation.
   vllm_max_model_len: 32768
   # Native W4 has enough headroom for CUDA graphs on four L4 shards.
   vllm_max_num_seqs: 4

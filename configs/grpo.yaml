@@ -59,7 +59,8 @@ rollout:
   vllm_pipeline_parallel_size: 1
   # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
   vllm_language_model_only: true
-  # Gemma 4's full context; submission sampling reserves up to 8k per turn.
+  # Gemma 4's full context; submission sampling reserves up to 4k per turn so
+  # the accumulated tool history can grow to almost 29k without rejection.
   vllm_max_model_len: 32768
   # Continuous batching keeps all four independent agent trajectories active.
   vllm_max_num_seqs: 4

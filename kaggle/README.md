@@ -214,9 +214,10 @@ Managed server также включает `--language-model-only`: SWEGemma cod
 содержат изображений, а vision tower этого checkpoint не нужен для rollout.
 Rollout context остаётся 32768 независимо от `grpo.max_seq_length`: smoke
 фильтрует обучающие траектории по 8192. На каждом tool-turn SWEGemma резервирует
-до 8192 новых токенов, оставляя примерно 24k контекста под накопленную историю.
-Не возвращайте `max_output_tokens: 16384`: при истории длиннее 16k vLLM отклонит
-запрос, потому что prompt и зарезервированный completion вместе превысят 32768.
+до 4096 новых токенов, оставляя почти 29k контекста под накопленную историю.
+Не возвращайте `max_output_tokens: 8192`: при истории в 24577 токенов vLLM
+отклонит запрос, потому что prompt и зарезервированный completion вместе
+превысят 32768.
 Вывод managed vLLM одновременно показывается в stdout notebook и сохраняется в
 `<run>/vllm/collection_NNNN/vllm.log`.
 Native W4 использует `TP=4`, CUDA graphs и `max_num_seqs=4`. Четыре seed'а
