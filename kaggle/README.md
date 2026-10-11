@@ -28,9 +28,9 @@ SHA256 Linux-wheel `bitsandbytes==0.48.1`. vLLM 0.19.1 использует со
 4. `timurakimoff/gemma-grpo-source`;
 5. со второй сессии — сохранённый NF4 checkpoint предыдущей версии notebook.
 
-Для отдельного teacher-run дополнительно подключите Hugging Face model
-`inference-optimization/Qwen3-Coder-Next.w4a16` как Kaggle Input. Это готовый
-43.9 GB `compressed-tensors` W4A16 checkpoint; не копируйте его в
+Для отдельного teacher-run дополнительно подключите Kaggle Dataset
+`wukeneth/qwen3-coder-next-awq-dataset`. Это готовый примерно 43 GB
+`compressed-tensors` AWQ W4A16 checkpoint; не копируйте его в
 `/kaggle/working`.
 
 Accelerator: `GPU L4 ×4`. Internet: Off.
@@ -356,10 +356,13 @@ subprocess.run(
 ```
 
 `teacher-qwen.yaml` использует TP=4, `qwen3_coder`, 32k context и четыре
-одновременных seed. Qwen3-Coder-Next не имеет thinking mode, поэтому Gemma
-reasoning parser отключён. Сырые Qwen token IDs также отключены: при дальнейшем
-SFT teacher messages заново токенизируются Gemma tokenizer. Оставляйте только
-`resolved=true`; failed teacher traces не становятся SFT targets.
+одновременных seed. Qwen3-Coder-Next не имеет thinking mode, поэтому reasoning
+parser отключён. Границы `<think>`/`</think>` передаются только как compatibility
+shim: SWEGemma/ADK добавляет `thinking_token_budget`, который vLLM 0.19 не
+принимает без `reasoning_config`. Это не включает thinking. Сырые Qwen token IDs
+также отключены: при дальнейшем SFT teacher messages заново токенизируются Gemma
+tokenizer. Оставляйте только `resolved=true`; failed teacher traces не становятся
+SFT targets.
 
 Обучение по всем накопленным JSONL (global batch равен четырём GPU):
 

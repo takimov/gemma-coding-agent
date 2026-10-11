@@ -139,7 +139,10 @@ def test_qwen_teacher_uses_its_alias_parser_and_no_reasoning_parser(
     )
     assert command[command.index("--tool-call-parser") + 1] == "qwen3_coder"
     assert "--reasoning-parser" not in command
-    assert "--reasoning-config" not in command
+    assert json.loads(command[command.index("--reasoning-config") + 1]) == {
+        "reasoning_start_str": "<think>",
+        "reasoning_end_str": "</think>",
+    }
     assert json.loads(command[command.index("--default-chat-template-kwargs") + 1]) == {
         "enable_thinking": False
     }

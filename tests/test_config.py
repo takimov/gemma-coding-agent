@@ -50,8 +50,8 @@ def test_qwen_teacher_config_discards_cross_tokenizer_ids():
     assert config.rollout.vllm_served_model_name == "qwen3-coder-next-teacher"
     assert config.rollout.vllm_tool_call_parser == "qwen3_coder"
     assert config.rollout.vllm_reasoning_parser is None
-    assert config.rollout.vllm_reasoning_start_str is None
-    assert config.rollout.vllm_reasoning_end_str is None
+    assert config.rollout.vllm_reasoning_start_str == "<think>"
+    assert config.rollout.vllm_reasoning_end_str == "</think>"
     assert config.rollout.vllm_enable_thinking is False
     assert config.rollout.preserve_trace_token_ids is False
     assert config.rollout.vllm_tensor_parallel_size == 4

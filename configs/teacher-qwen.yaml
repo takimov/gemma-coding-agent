@@ -47,11 +47,14 @@ rollout:
   vllm_checkpoint_format: compressed-tensors
   vllm_served_model_name: qwen3-coder-next-teacher
   vllm_tool_call_parser: qwen3_coder
-  # Qwen3-Coder-Next is explicitly a non-thinking model.  Do not apply Gemma's
-  # channel parser or preserve Qwen token ids in Gemma training examples.
+  # Qwen3-Coder-Next is explicitly a non-thinking model, so do not enable a
+  # reasoning parser.  SWEGemma/ADK nevertheless sends thinking_token_budget
+  # on every request.  vLLM 0.19 rejects that field unless reasoning_config is
+  # present, so configure Qwen's real delimiter tokens as a compatibility shim.
+  # They do not turn thinking on and do not split ordinary model output.
   vllm_reasoning_parser: null
-  vllm_reasoning_start_str: null
-  vllm_reasoning_end_str: null
+  vllm_reasoning_start_str: "<think>"
+  vllm_reasoning_end_str: "</think>"
   vllm_enable_thinking: false
   preserve_trace_token_ids: false
   vllm_port: 8000
