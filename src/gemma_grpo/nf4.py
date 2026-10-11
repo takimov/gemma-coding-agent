@@ -116,6 +116,62 @@ def _requantize_linears_to_nf4(
     return model
 
 
+def _replace_source_quantizer_for_save(model: Any, bnb_config: Any) -> None:
+    """Detach compressed-tensors load conversions before saving BNB weights.
+
+    Transformers 5 stores the exact WeightConverter chain used by
+    ``from_pretrained`` on ``model._weight_conversions`` and reverses it during
+    ``save_pretrained``. After we replace the dense modules with Linear4bit,
+    that chain still describes the source compressed-tensors checkpoint and is
+    no longer reversible. Keeping it produces ``NoneType.convert`` while
+    saving. Rebuild only the model's normal key mapping and expose the actual
+    BNB quantizer which owns the serialized checkpoint now.
+    """
+    from transformers.quantizers import AutoHfQuantizer
+
+    # ``None`` intentionally asks save_pretrained to reconstruct only the
+    # architecture's ordinary key-renaming mapping. It must not reuse the
+    # compressed-tensors deserialization operations from the source load.
+    model._weight_conversions = None
+    model.hf_quantizer = AutoHfQuantizer.from_config(
+        bnb_config,
+        pre_quantized=True,
+    )
+    model.quantization_method = bnb_config.quant_method
+    model.config.quantization_config = bnb_config
+
+
+def _save_nf4_model(model: Any, directory: Path, *, max_shard_size: str) -> str:
+    """Save BNB weights, falling back only for a non-reversible v5 mapping."""
+    kwargs = {
+        "safe_serialization": True,
+        "max_shard_size": max_shard_size,
+    }
+    try:
+        model.save_pretrained(directory, **kwargs)
+        return "original"
+    except AttributeError as error:
+        # Some Transformers 5 VLM revisions have a model-level converter whose
+        # reverse operation is literally ``None``. This is independent of BNB.
+        # The supported escape hatch is to save the current canonical model
+        # keys instead of trying to recreate a legacy checkpoint layout.
+        if "NoneType" not in str(error) or "convert" not in str(error):
+            raise
+        print(
+            "[nf4] source key mapping is not reversible; retrying in canonical "
+            "Transformers format",
+            flush=True,
+        )
+        shutil.rmtree(directory)
+        directory.mkdir(parents=True)
+        model.save_pretrained(
+            directory,
+            save_original_format=False,
+            **kwargs,
+        )
+        return "canonical"
+
+
 def convert_to_nf4_checkpoint(
     *,
     source_model: str | Path,
@@ -191,19 +247,15 @@ def convert_to_nf4_checkpoint(
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_storage=dtype,
     )
-    model.config.quantization_config = bnb_config.to_dict()
-    # The source loader installs a compressed-tensors quantizer on the model.
-    # It must not control serialization of the newly created BNB parameters.
-    if hasattr(model, "hf_quantizer"):
-        model.hf_quantizer = None
+    _replace_source_quantizer_for_save(model, bnb_config)
 
     temporary = Path(
         tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent)
     )
     try:
-        model.save_pretrained(
+        saved_key_format = _save_nf4_model(
+            model,
             temporary,
-            safe_serialization=True,
             max_shard_size=max_shard_size,
         )
         tokenizer.save_pretrained(temporary)
@@ -214,6 +266,7 @@ def convert_to_nf4_checkpoint(
             "compute_dtype": "bfloat16",
             "quant_storage": "bfloat16",
             "double_quant": True,
+            "key_format": saved_key_format,
             "packages": {},
         }
         for package in ("torch", "transformers", "bitsandbytes"):
