@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-REPO_URL = "REPLACE_WITH_PUBLIC_GITHUB_REPOSITORY"
+REPO_URL = "https://github.com/takimov/gemma-coding-agent.git"
 BRANCH = "main"
 PROJECT = Path("/kaggle/working/gemma-grpo-live")
 
