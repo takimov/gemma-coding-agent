@@ -20,6 +20,7 @@ from .swegemma_cli import SwegemmaInvocation, run_eval
 from .tasks import append_jsonl, read_jsonl, select_tasks, task_id, task_prompt
 from .traces import (
     count_tool_calls,
+    has_tool_budget_exhaustion,
     load_trace,
     normalize_trace,
     trace_token_segments,
@@ -220,6 +221,10 @@ def collect_rollouts(
             if not messages:
                 tool_calls = count_tool_calls(trace)
             outcome = score_result(result, patch=patch, tool_calls=tool_calls, config=config.reward)
+            tool_budget_exhausted = any(
+                has_tool_budget_exhaustion(value)
+                for value in (trace, result, completed.stdout)
+            )
             token_segments = (
                 trace_token_segments(trace)
                 if config.rollout.preserve_trace_token_ids
@@ -228,11 +233,17 @@ def collect_rollouts(
             has_trainable_trace = bool(token_segments) or any(
                 message.get("role") == "assistant" for message in messages
             )
-            reward = outcome.reward if has_trainable_trace else None
-            scorable = outcome.scorable and has_trainable_trace
-            reward_reason = (
-                outcome.reason if has_trainable_trace else "missing_trainable_trace"
-            )
+            trace_trainable = has_trainable_trace and not tool_budget_exhausted
+            if tool_budget_exhausted:
+                reward = None
+                scorable = False
+                reward_reason = "tool_budget_exhausted"
+            else:
+                reward = outcome.reward if has_trainable_trace else None
+                scorable = outcome.scorable and has_trainable_trace
+                reward_reason = (
+                    outcome.reason if has_trainable_trace else "missing_trainable_trace"
+                )
             row: dict[str, Any] = {
                 "task_id": current_task_id,
                 "group_id": group_id,
@@ -250,7 +261,8 @@ def collect_rollouts(
                 "tools": trace_tool_definitions(trace),
                 "token_segments": token_segments,
                 "token_source": "atif_token_ids" if token_segments else "chat_template_reconstruction",
-                "trace_trainable": has_trainable_trace,
+                "trace_trainable": trace_trainable,
+                "tool_budget_exhausted": tool_budget_exhausted,
                 "swegemma_returncode": completed.returncode,
                 "swegemma_output_tail": completed.stdout[-4000:],
                 "result": result,

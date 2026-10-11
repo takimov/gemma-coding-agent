@@ -362,7 +362,10 @@ shim: SWEGemma/ADK добавляет `thinking_token_budget`, который vL
 принимает без `reasoning_config`. Это не включает thinking. Сырые Qwen token IDs
 также отключены: при дальнейшем SFT teacher messages заново токенизируются Gemma
 tokenizer. Оставляйте только `resolved=true`; failed teacher traces не становятся
-SFT targets.
+SFT targets. Teacher получает до 50 tool calls. Если trace содержит явный
+`BudgetExceeded`, collector помечает trajectory как `tool_budget_exhausted`,
+ставит `scorable=false` и не допускает её ни в GRPO, ни в SFT, даже если harness
+успел записать положительный verification result.
 
 Обучение по всем накопленным JSONL (global batch равен четырём GPU):
 

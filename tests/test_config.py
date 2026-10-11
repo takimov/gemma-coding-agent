@@ -54,6 +54,7 @@ def test_qwen_teacher_config_discards_cross_tokenizer_ids():
     assert config.rollout.vllm_reasoning_end_str == "</think>"
     assert config.rollout.vllm_enable_thinking is False
     assert config.rollout.preserve_trace_token_ids is False
+    assert config.rollout.max_tool_calls == 50
     assert config.rollout.vllm_tensor_parallel_size == 4
     assert config.rollout.vllm_max_model_len == 32768
 

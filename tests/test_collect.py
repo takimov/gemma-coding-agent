@@ -169,3 +169,71 @@ def test_collect_rollouts_checkpoints_completed_task_before_later_failure(
     assert len(saved) == 4
     assert {row["task_id"] for row in saved} == {"task_1"}
 
+
+def test_collect_rejects_tool_budget_exhausted_trajectory(tmp_path, monkeypatch):
+    source = tmp_path / "submission"
+    (source / "configs").mkdir(parents=True)
+    (source / "configs" / "sampling.yaml").write_text("seed: 1\n", encoding="utf-8")
+    (source / "eval_config.yaml").write_text("evaluation: {}\n", encoding="utf-8")
+    (source / "agent.yaml").write_text("name: a\nmodel: base\n", encoding="utf-8")
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text(
+        json.dumps({"instance_id": "task_1", "problem_statement": "fix it"}) + "\n",
+        encoding="utf-8",
+    )
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+
+    def fake_run_eval(invocation, *, check=False):
+        invocation.results_dir.mkdir(parents=True, exist_ok=True)
+        (invocation.results_dir / "task_results.jsonl").write_text(
+            json.dumps({"instance_id": "task_1", "resolved": True}) + "\n",
+            encoding="utf-8",
+        )
+        traces = invocation.results_dir / "traces"
+        traces.mkdir()
+        (traces / "trace_task_1.json").write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {"source": "agent", "content": "trying another tool"},
+                        {
+                            "source": "tool",
+                            "content": {
+                                "status": "error",
+                                "error_type": "BudgetExceeded",
+                                "error_message": "Tool call budget exhausted (50 calls)",
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess([], 0, stdout="ok")
+
+    monkeypatch.setattr("gemma_grpo.collect.run_eval", fake_run_eval)
+    config = load_config("configs/smoke.yaml")
+    config = replace(
+        config,
+        rollout=replace(config.rollout, managed_vllm=False, concurrency=1),
+    )
+
+    rows = collect_rollouts(
+        config=config,
+        tasks_path=tasks,
+        snapshots_dir=snapshots,
+        submission_dir=source,
+        results_root=tmp_path / "results",
+        output_path=tmp_path / "rollouts.jsonl",
+        iteration=0,
+    )
+
+    assert len(rows) == 4
+    assert all(row["resolved"] is True for row in rows)
+    assert all(row["tool_budget_exhausted"] is True for row in rows)
+    assert all(row["scorable"] is False for row in rows)
+    assert all(row["reward"] is None for row in rows)
+    assert all(row["reward_reason"] == "tool_budget_exhausted" for row in rows)
+    assert all(row["trace_trainable"] is False for row in rows)
+

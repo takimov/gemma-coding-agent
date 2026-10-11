@@ -1,9 +1,33 @@
 from gemma_grpo.traces import (
     count_tool_calls,
+    has_tool_budget_exhaustion,
     normalize_trace,
     trace_token_segments,
     trace_tool_definitions,
 )
+
+
+def test_tool_budget_exhaustion_is_found_in_nested_tool_result():
+    trace = {
+        "steps": [
+            {
+                "observation": {
+                    "results": [
+                        {
+                            "content": {
+                                "status": "error",
+                                "error_type": "BudgetExceeded",
+                                "error_message": "Tool call budget exhausted (50 calls)",
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    assert has_tool_budget_exhaustion(trace)
+    assert not has_tool_budget_exhaustion({"error_type": "FileReadError"})
 
 
 def test_native_messages_are_preserved():

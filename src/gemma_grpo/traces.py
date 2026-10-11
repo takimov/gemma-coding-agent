@@ -7,6 +7,23 @@ from typing import Any
 
 
 VALID_ROLES = {"system", "user", "assistant", "tool"}
+TOOL_BUDGET_MARKERS = (
+    "budgetexceeded",
+    "tool call budget exhausted",
+    "tool-call budget exhausted",
+)
+
+
+def has_tool_budget_exhaustion(value: Any) -> bool:
+    """Detect an explicit SWEGemma tool-budget rejection in nested artifacts."""
+    if isinstance(value, str):
+        normalized = value.casefold()
+        return any(marker in normalized for marker in TOOL_BUDGET_MARKERS)
+    if isinstance(value, Mapping):
+        return any(has_tool_budget_exhaustion(child) for child in value.values())
+    if isinstance(value, list | tuple):
+        return any(has_tool_budget_exhaustion(child) for child in value)
+    return False
 
 
 def _as_text(value: Any) -> str:
