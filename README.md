@@ -1,17 +1,18 @@
 # SWEGemma GRPO: FSDP + QLoRA
 
 Экспериментальный on-policy GRPO-loop для соревнования Gemma 4 Developer Agent.
-Rollout и обучение используют один постоянный bitsandbytes NF4 checkpoint;
-31B-модель больше не распаковывается и не переквантуется перед каждым update.
+Rollout и обучение используют два постоянных storage-представления одних и тех
+же bitsandbytes NF4-байтов; 31B-модель больше не распаковывается и не
+переквантуется перед каждым update.
 
 ## Архитектура
 
 Один процесс автоматически чередует две взаимоисключающие фазы на 4×L4:
 
-1. managed vLLM загружает NF4 checkpoint tensor-parallel на четыре GPU и
+1. managed vLLM загружает byte-packed NF4 view pipeline-parallel на четыре GPU и
    собирает четыре SWEGemma rollout'а;
 2. vLLM полностью останавливается и освобождает VRAM;
-3. четыре train-процесса загружают тот же NF4 checkpoint, FSDP `FULL_SHARD`
+3. четыре train-процесса загружают BF16-storage NF4 checkpoint, FSDP `FULL_SHARD`
    распределяет параметры/градиенты/optimizer state, а QLoRA обновляет adapter;
 4. adapter сохраняется, vLLM запускается с ним, и цикл повторяется.
 
@@ -26,7 +27,8 @@ NF4 относится к большим Linear-весам. Frozen embedding/lm_
 ## Команды
 
 - `gemma-grpo convert-nf4` — одноразово создаёт постоянный NF4 checkpoint;
-- `gemma-grpo preflight` — проверяет checkpoint, 4 GPU, версии и vLLM BNB plugin;
+- `gemma-grpo prepare-vllm-nf4` — без потерь переупаковывает его для vLLM 0.19;
+- `gemma-grpo preflight` — проверяет оба checkpoint, 4 GPU и версии;
 - `gemma-grpo collect` — запускает managed NF4 vLLM и собирает rollout-группу;
 - `gemma-grpo train` — один FSDP-QLoRA GRPO update;
 - `gemma-grpo loop` — непрерывно чередует collect/train до целевого числа steps;
@@ -42,6 +44,10 @@ Competition checkpoint — `compressed-tensors` QAT W4. Его нужно пре
 gemma-grpo convert-nf4 \
   --source-model /path/to/gemma-4-31b-it-qat-w4a16-ct \
   --output-dir /path/to/gemma-4-31b-nf4
+
+gemma-grpo prepare-vllm-nf4 \
+  --source-model /path/to/gemma-4-31b-nf4 \
+  --output-dir /path/to/gemma-4-31b-nf4-vllm
 ```
 
 Конвертер распаковывает source на CPU, последовательно квантует Linear-слои на
@@ -58,7 +64,8 @@ gemma-grpo preflight \
   --tasks /path/to/tasks.jsonl \
   --snapshots-dir /path/to/snapshots \
   --submission-dir submission \
-  --model-path /path/to/gemma-4-31b-nf4
+  --model-path /path/to/gemma-4-31b-nf4 \
+  --rollout-model-path /path/to/gemma-4-31b-nf4-vllm
 
 gemma-grpo loop \
   --config configs/smoke.yaml \
@@ -66,6 +73,7 @@ gemma-grpo loop \
   --snapshots-dir /path/to/snapshots \
   --submission-dir submission \
   --model-path /path/to/gemma-4-31b-nf4 \
+  --rollout-model-path /path/to/gemma-4-31b-nf4-vllm \
   --task-id ACTUAL_TASK_ID \
   --work-dir runs/smoke-fsdp \
   --target-steps 1 \
@@ -104,11 +112,11 @@ pip install --no-build-isolation -e '.[dev,train]'
 PYTHONPATH=src pytest -q
 ```
 
-В Kaggle vLLM 0.19+ требует отдельный `vllm-bnb-plugin`, а competition
-wheelhouse содержит слишком старый `bitsandbytes`. Publisher кладёт
-зафиксированный официальный plugin wheel и проверенный Linux-wheel
-`bitsandbytes==0.48.1` в private source dataset, потому что Internet с L4×4
-выключен. Без них preflight завершится до загрузки 31B.
+Competition wheelhouse содержит слишком старый `bitsandbytes`, поэтому
+publisher кладёт проверенный Linux-wheel `bitsandbytes==0.48.1` в private source
+dataset. vLLM 0.19.1 уже имеет встроенный BNB loader; более новый внешний
+`vllm-bnb-plugin` с ним несовместим и managed server явно отключает его через
+`VLLM_PLUGINS=""`.
 
 Подробные готовые notebook cells находятся в
 [`kaggle/README.md`](kaggle/README.md), а допущения и остаточные риски — в

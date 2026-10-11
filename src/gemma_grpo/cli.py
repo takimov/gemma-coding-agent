@@ -9,7 +9,7 @@ from .config import load_config
 from .export import export_submission
 from .loop import run_training_loop
 from .monitoring import summarize_telemetry
-from .nf4 import convert_to_nf4_checkpoint
+from .nf4 import convert_to_nf4_checkpoint, prepare_vllm_nf4_checkpoint
 from .preflight import run_preflight
 from .train import train_adapter
 from .vllm_server import rollout_models_yaml
@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--snapshots-dir")
     preflight.add_argument("--submission-dir", default="submission")
     preflight.add_argument("--model-path")
+    preflight.add_argument("--rollout-model-path")
     preflight.add_argument("--skip-tokenizer", action="store_true")
 
     collect = subparsers.add_parser("collect", help="collect canonical SWEGemma rollouts")
@@ -46,12 +47,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     convert_nf4 = subparsers.add_parser(
         "convert-nf4",
-        help="convert the competition W4 checkpoint once into reusable FSDP/vLLM NF4",
+        help="convert the competition W4 checkpoint once into reusable FSDP NF4",
     )
     convert_nf4.add_argument("--source-model", required=True)
     convert_nf4.add_argument("--output-dir", required=True)
     convert_nf4.add_argument("--trust-remote-code", action="store_true")
     convert_nf4.add_argument("--max-shard-size", default="4GB")
+
+    prepare_vllm_nf4 = subparsers.add_parser(
+        "prepare-vllm-nf4",
+        help="losslessly bitcast the FSDP NF4 checkpoint for vLLM 0.19",
+    )
+    prepare_vllm_nf4.add_argument("--source-model", required=True)
+    prepare_vllm_nf4.add_argument("--output-dir", required=True)
 
     train = subparsers.add_parser("train", help="perform one on-policy artifact GRPO update")
     train.add_argument("--config", default="configs/grpo.yaml")
@@ -77,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument("--submission-dir", default="submission")
     loop.add_argument("--work-dir", required=True)
     loop.add_argument("--model-path")
+    loop.add_argument("--rollout-model-path")
     loop.add_argument("--task-id", action="append", dest="task_ids")
     loop.add_argument("--initial-adapter")
     loop.add_argument("--models-yaml")
@@ -95,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             snapshots_dir=Path(args.snapshots_dir).resolve() if args.snapshots_dir else None,
             submission_dir=Path(args.submission_dir).resolve(),
             model_path=args.model_path,
+            rollout_model_path=args.rollout_model_path,
             check_tokenizer=not args.skip_tokenizer,
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -141,6 +151,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(created)
         return 0
+    if args.command == "prepare-vllm-nf4":
+        created = prepare_vllm_nf4_checkpoint(
+            source_model=Path(args.source_model),
+            output_dir=Path(args.output_dir),
+        )
+        print(created)
+        return 0
     if args.command == "train":
         summary = train_adapter(
             config=load_config(args.config),
@@ -171,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             submission_dir=Path(args.submission_dir).resolve(),
             work_dir=Path(args.work_dir).resolve(),
             model_path=args.model_path,
+            rollout_model_path=args.rollout_model_path,
             selected_ids=set(args.task_ids) if args.task_ids else None,
             initial_adapter=(
                 Path(args.initial_adapter).resolve() if args.initial_adapter else None

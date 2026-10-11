@@ -18,9 +18,9 @@ train = [
   "accelerate>=1.10",
   "bitsandbytes>=0.48.1",
   "peft>=0.17",
+  "safetensors>=0.6",
   "torch>=2.7",
   "transformers>=5.0",
-  "vllm-bnb-plugin>=0.0.3",
 ]
 dev = [
   "pytest>=8.4",

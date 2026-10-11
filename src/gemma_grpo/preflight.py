@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -13,10 +14,9 @@ import yaml
 from packaging.version import InvalidVersion, Version
 
 from .config import ExperimentConfig
-from .nf4 import assert_nf4_checkpoint
+from .nf4 import assert_nf4_checkpoint, assert_vllm_nf4_checkpoint
 from .tasks import read_jsonl
 from .tokenization import assert_prefix_preserving
-from .vllm_server import vllm_bnb_plugin_status
 
 
 PACKAGES = (
@@ -28,15 +28,15 @@ PACKAGES = (
     "torch",
     "accelerate",
     "bitsandbytes",
+    "safetensors",
     "vllm",
-    "vllm-bnb-plugin",
 )
 MINIMUM_PACKAGE_VERSIONS = {
     "accelerate": "1.10",
     "bitsandbytes": "0.48.1",
     "peft": "0.17",
+    "safetensors": "0.6",
     "transformers": "5.0",
-    "vllm-bnb-plugin": "0.0.3",
 }
 ALLOWED_TOOLS = {
     "run_command",
@@ -69,6 +69,7 @@ def run_preflight(
     snapshots_dir: Path | None,
     submission_dir: Path,
     model_path: str | None,
+    rollout_model_path: str | None,
     check_tokenizer: bool,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
@@ -184,6 +185,23 @@ def run_preflight(
             record("saved NF4 checkpoint", True, str(path))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             record("saved NF4 checkpoint", False, str(error))
+        if config.rollout.managed_vllm:
+            if rollout_model_path is None:
+                record(
+                    "byte-packed rollout NF4 checkpoint",
+                    False,
+                    "missing --rollout-model-path",
+                )
+            else:
+                try:
+                    assert_vllm_nf4_checkpoint(rollout_model_path)
+                    record(
+                        "byte-packed rollout NF4 checkpoint",
+                        True,
+                        str(Path(rollout_model_path)),
+                    )
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    record("byte-packed rollout NF4 checkpoint", False, str(error))
 
     try:
         import torch
@@ -193,7 +211,12 @@ def run_preflight(
             config.distributed.num_processes
             if config.distributed.strategy == "fsdp"
             else 1,
-            config.rollout.vllm_tensor_parallel_size if config.rollout.managed_vllm else 1,
+            (
+                config.rollout.vllm_tensor_parallel_size
+                * config.rollout.vllm_pipeline_parallel_size
+                if config.rollout.managed_vllm
+                else 1
+            ),
         )
         record(
             "CUDA device count",
@@ -204,16 +227,38 @@ def run_preflight(
         record("CUDA device count", False, str(error))
 
     if config.rollout.managed_vllm:
-        plugin_ok, plugin_detail = vllm_bnb_plugin_status()
-        record("vLLM BitsAndBytes plugin", plugin_ok, plugin_detail)
+        environment = os.environ.copy()
+        environment["VLLM_PLUGINS"] = ""
+        builtin = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from vllm.model_executor.layers.quantization.bitsandbytes "
+                "import BitsAndBytesConfig; "
+                "from vllm.model_executor.model_loader.bitsandbytes_loader "
+                "import BitsAndBytesModelLoader; print('ok')",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=environment,
+        )
+        builtin_ok = builtin.returncode == 0 and builtin.stdout.strip().endswith("ok")
+        record(
+            "vLLM built-in BitsAndBytes",
+            builtin_ok,
+            "ok" if builtin_ok else builtin.stdout[-2000:],
+        )
         completed = subprocess.run(
             [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--help"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=environment,
         )
         required_flags = [
             "--tensor-parallel-size",
+            "--pipeline-parallel-size",
             "--served-model-name",
             "--quantization",
             "--load-format",

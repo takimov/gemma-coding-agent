@@ -1,7 +1,8 @@
 # Kaggle 4×L4: FSDP + QLoRA + NF4 rollout
 
-Notebook работает с выключенным Internet. Managed loop использует один
-постоянный NF4 checkpoint и сам чередует vLLM TP=4 с FSDP `FULL_SHARD`=4.
+Notebook работает с выключенным Internet. Managed loop использует два
+постоянных storage-представления одних NF4-байтов и сам чередует vLLM PP=4 с
+FSDP `FULL_SHARD`=4.
 Одновременно эти процессы не живут: перед training vLLM завершается и отдаёт
 всю VRAM.
 
@@ -13,10 +14,9 @@ Notebook работает с выключенным Internet. Managed loop ис�
 python scripts/publish_kaggle_dataset.py
 ```
 
-Publisher архивирует Git `HEAD`, пишет `commit.txt`, собирает зафиксированный
-официальный `vllm-bnb-plugin` wheel и скачивает проверенный по SHA256 Linux-wheel
-`bitsandbytes==0.48.1`. Plugin обязателен: в vLLM 0.19.1 NF4/BnB поддержка
-вынесена из основного пакета. Dataset по умолчанию:
+Publisher архивирует Git `HEAD`, пишет `commit.txt` и скачивает проверенный по
+SHA256 Linux-wheel `bitsandbytes==0.48.1`. vLLM 0.19.1 использует собственный
+встроенный BNB loader. Dataset по умолчанию:
 `timurakimoff/gemma-grpo-source`.
 
 ## Inputs
@@ -27,7 +27,7 @@ Publisher архивирует Git `HEAD`, пишет `commit.txt`, собира
 2. `google/gemma-4`, вариант `gemma-4-31b-it-qat-w4a16-ct`;
 3. `metric/gemma-4-developer-agent-wheelhouse`;
 4. `timurakimoff/gemma-grpo-source`;
-5. со второй сессии — сохранённый NF4 checkpoint предыдущей версии notebook.
+5. со второй сессии — обе сохранённые NF4-директории предыдущей версии notebook.
 
 Accelerator: `GPU L4 ×4`. Internet: Off.
 
@@ -46,9 +46,8 @@ INPUT = Path("/kaggle/input")
 PROJECT = Path("/kaggle/working/gemma-grpo")
 
 wheel_dir = next(INPUT.rglob("swegemma-*.whl")).parent
-plugin_wheel = next(INPUT.rglob("vllm_bnb_plugin-*.whl"))
-asset_root = plugin_wheel.parent
-bnb_wheel = next(asset_root.glob("bitsandbytes-0.48.1-*.whl"))
+bnb_wheel = next(INPUT.rglob("bitsandbytes-0.48.1-*.whl"))
+asset_root = bnb_wheel.parent
 data_root = next(
     path.parent
     for path in INPUT.rglob("tasks.jsonl")
@@ -123,13 +122,6 @@ subprocess.run(
 )
 subprocess.run(
     [
-        sys.executable, "-m", "pip", "install", "-q", "--no-deps",
-        "--force-reinstall", str(plugin_wheel),
-    ],
-    check=True,
-)
-subprocess.run(
-    [
         sys.executable, "-m", "pip", "install", "-e", str(PROJECT),
         "--no-deps", "--no-build-isolation",
     ],
@@ -142,10 +134,9 @@ print("commit:", commit_file.read_text().strip())
 print("source W4:", source_w4)
 print("competition data:", data_root)
 print("bitsandbytes:", bnb_wheel.name)
-print("NF4 plugin:", plugin_wheel.name)
 ```
 
-## Ячейка 2 — выбрать или один раз создать NF4 checkpoint
+## Ячейка 2 — выбрать или один раз создать две NF4 storage-view
 
 ```python
 import torch
@@ -155,7 +146,7 @@ for index in range(4):
     props = torch.cuda.get_device_properties(index)
     print(index, props.name, round(props.total_memory / 2**30, 1), "GiB")
 
-def is_nf4(path):
+def is_nf4(path, storage):
     try:
         config = json.loads((path / "config.json").read_text())
         quant = config.get("quantization_config") or {}
@@ -163,17 +154,21 @@ def is_nf4(path):
             str(quant.get("quant_method", "")).startswith("bitsandbytes")
             and quant.get("load_in_4bit") is True
             and quant.get("bnb_4bit_quant_type") == "nf4"
-            and str(quant.get("bnb_4bit_quant_storage")) in {"bfloat16", "torch.bfloat16"}
+            and str(quant.get("bnb_4bit_quant_storage")) in storage
         )
     except (OSError, ValueError, TypeError):
         return False
 
-mounted_nf4 = [path.parent for path in INPUT.rglob("config.json") if is_nf4(path.parent)]
+mounted_nf4 = [
+    path.parent
+    for path in INPUT.rglob("config.json")
+    if is_nf4(path.parent, {"bfloat16", "torch.bfloat16"})
+]
 NF4_DIR = mounted_nf4[0] if mounted_nf4 else Path(
     "/kaggle/working/models/gemma-4-31b-nf4"
 )
 
-if not is_nf4(NF4_DIR):
+if not is_nf4(NF4_DIR, {"bfloat16", "torch.bfloat16"}):
     subprocess.run(
         [
             "gemma-grpo", "convert-nf4",
@@ -184,13 +179,32 @@ if not is_nf4(NF4_DIR):
         cwd=PROJECT,
     )
 
-print("persistent NF4 checkpoint:", NF4_DIR)
+mounted_vllm_nf4 = [
+    path.parent
+    for path in INPUT.rglob("config.json")
+    if is_nf4(path.parent, {"uint8", "torch.uint8"})
+]
+VLLM_NF4_DIR = mounted_vllm_nf4[0] if mounted_vllm_nf4 else Path(
+    "/kaggle/working/models/gemma-4-31b-nf4-vllm"
+)
+if not is_nf4(VLLM_NF4_DIR, {"uint8", "torch.uint8"}):
+    subprocess.run(
+        [
+            "gemma-grpo", "prepare-vllm-nf4",
+            "--source-model", str(NF4_DIR),
+            "--output-dir", str(VLLM_NF4_DIR),
+        ],
+        check=True,
+        cwd=PROJECT,
+    )
+
+print("persistent FSDP NF4 checkpoint:", NF4_DIR)
+print("persistent vLLM NF4 view:", VLLM_NF4_DIR)
 ```
 
-Это единственное место, где исходный W4 распаковывается и переквантуется.
-Конвертация требует системную RAM и использует GPU 0 только как scratch. После
-этого и vLLM, и FSDP читают уже сохранённый NF4. Сохраните `NF4_DIR` как output
-первой notebook version и подключайте его как input в следующих сессиях.
+Только первый шаг распаковывает W4 и квантует веса. `prepare-vllm-nf4` лишь
+побитово меняет storage layout BF16→uint8, не деквантуя и не переквантуя NF4.
+Сохраните обе директории как notebook output для следующих сессий.
 
 ## Ячейка 3 — preflight
 
@@ -203,15 +217,15 @@ subprocess.run(
         "--snapshots-dir", str(data_root / "snapshots"),
         "--submission-dir", str(PROJECT / "submission"),
         "--model-path", str(NF4_DIR),
+        "--rollout-model-path", str(VLLM_NF4_DIR),
     ],
     check=True,
     cwd=PROJECT,
 )
 ```
 
-Preflight должен подтвердить `vllm-bnb-plugin`, BNB ≥0.48.1, сохранённый NF4
-с BF16 quant storage и четыре CUDA device. При любой красной проверке 31B не
-запускайте.
+Preflight должен подтвердить BNB ≥0.48.1, BF16-storage FSDP checkpoint,
+byte-packed rollout view, встроенный BNB loader и четыре CUDA device.
 
 ## Ячейка 4 — обязательный smoke
 
@@ -234,6 +248,7 @@ command = [
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
     "--model-path", str(NF4_DIR),
+    "--rollout-model-path", str(VLLM_NF4_DIR),
     "--task-id", TASK_IDS[0],
     "--work-dir", str(smoke_dir),
     "--target-steps", "1",
@@ -287,6 +302,7 @@ command = [
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
     "--model-path", str(NF4_DIR),
+    "--rollout-model-path", str(VLLM_NF4_DIR),
     "--work-dir", str(run_dir),
     "--target-steps", "100",
     "--max-collections", "200",

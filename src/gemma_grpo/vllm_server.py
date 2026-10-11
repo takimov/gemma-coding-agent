@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.metadata
 import json
 import os
 import signal
@@ -16,40 +15,11 @@ from typing import Iterator, TextIO
 import yaml
 
 from .config import ExperimentConfig
-from .nf4 import assert_nf4_checkpoint
+from .nf4 import assert_vllm_nf4_checkpoint
 
 
 BASE_MODEL_ALIAS = "gemma-4-31b-it-qat-w4a16-ct"
 ADAPTER_ALIAS = "main_lora"
-VLLM_BNB_DISTRIBUTION = "vllm-bnb-plugin"
-
-
-def vllm_bnb_plugin_status() -> tuple[bool, str]:
-    """Verify that vLLM can discover the out-of-tree BNB implementation."""
-    try:
-        version = importlib.metadata.version(VLLM_BNB_DISTRIBUTION)
-    except importlib.metadata.PackageNotFoundError:
-        return False, f"{VLLM_BNB_DISTRIBUTION} is not installed"
-
-    entry_points = importlib.metadata.entry_points()
-    plugins = entry_points.select(group="vllm.general_plugins")
-    matches = [entry for entry in plugins if entry.name == "bitsandbytes"]
-    if not matches:
-        return False, (
-            f"{VLLM_BNB_DISTRIBUTION} {version} is installed but its "
-            "vllm.general_plugins/bitsandbytes entry point is missing"
-        )
-    return True, f"{VLLM_BNB_DISTRIBUTION} {version}; entry={matches[0].value}"
-
-
-def assert_vllm_bnb_plugin() -> None:
-    ok, detail = vllm_bnb_plugin_status()
-    if not ok:
-        raise RuntimeError(
-            detail
-            + ". vLLM 0.19+ moved NF4 loading to this plugin; install the "
-            "offline wheel bundled with the gemma-grpo Kaggle source dataset."
-        )
 
 
 def write_models_yaml(path: Path, *, port: int, adapter: Path | None) -> Path:
@@ -93,11 +63,16 @@ class ManagedVllmServer:
         self.models_yaml = self.work_dir / "models.yaml"
 
     def _supported_flags(self) -> str:
+        environment = os.environ.copy()
+        # vLLM 0.19.1 already ships a built-in BNB loader. The later external
+        # plugin targets a newer vLLM API and must not be auto-loaded here.
+        environment["VLLM_PLUGINS"] = ""
         completed = subprocess.run(
             [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--help"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=environment,
         )
         if completed.returncode != 0:
             raise RuntimeError(
@@ -120,6 +95,8 @@ class ManagedVllmServer:
             str(rollout.vllm_port),
             "--tensor-parallel-size",
             str(rollout.vllm_tensor_parallel_size),
+            "--pipeline-parallel-size",
+            str(rollout.vllm_pipeline_parallel_size),
             "--gpu-memory-utilization",
             str(rollout.vllm_gpu_memory_utilization),
             "--max-model-len",
@@ -186,8 +163,7 @@ class ManagedVllmServer:
             return "(vLLM log unavailable)"
 
     def start(self) -> Path:
-        assert_vllm_bnb_plugin()
-        assert_nf4_checkpoint(self.model_path)
+        assert_vllm_nf4_checkpoint(self.model_path)
         if self.adapter is not None:
             for filename in ("adapter_config.json", "adapter_model.safetensors"):
                 if not (self.adapter / filename).is_file():
@@ -201,6 +177,7 @@ class ManagedVllmServer:
         self._log_handle = self.log_path.open("w", encoding="utf-8")
         environment = os.environ.copy()
         environment.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        environment["VLLM_PLUGINS"] = ""
         command = self._command()
         print(f"[vllm] starting NF4 server; log={self.log_path}", flush=True)
         self.process = subprocess.Popen(

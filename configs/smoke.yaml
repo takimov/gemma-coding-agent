@@ -44,7 +44,10 @@ rollout:
   seeds: [101, 202, 303, 404]
   managed_vllm: true
   vllm_port: 8000
-  vllm_tensor_parallel_size: 4
+  # vLLM 0.19 cannot shard a pre-quantized BNB tensor with TP. Pipeline
+  # parallelism keeps each quantized tensor intact while using all four L4s.
+  vllm_tensor_parallel_size: 1
+  vllm_pipeline_parallel_size: 4
   vllm_gpu_memory_utilization: 0.9
   vllm_startup_timeout_seconds: 900
 reward:

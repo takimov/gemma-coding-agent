@@ -7,14 +7,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 
 
 DEFAULT_DATASET = "timurakimoff/gemma-grpo-source"
-VLLM_BNB_PLUGIN_REPOSITORY = "https://github.com/vllm-project/vllm-bnb-plugin.git"
-# Pin the official plugin so an offline Kaggle run is reproducible even when
-# the repository's main branch moves independently of the competition image.
-VLLM_BNB_PLUGIN_COMMIT = "d4914a9e3c5927b33b7ef941385a4fda2187e2b9"
 BITSANDBYTES_VERSION = "0.48.1"
 BITSANDBYTES_SHA256 = "3e72cf07ba6d2169e69a61282a6f072fc675efee86049e56a33de099a0363ef2"
 
@@ -28,40 +23,6 @@ def _run(*args: str, cwd: Path, capture: bool = False) -> str:
         capture_output=capture,
     )
     return completed.stdout.strip() if capture else ""
-
-
-def _build_vllm_bnb_plugin_wheel(publish_dir: Path) -> Path:
-    with tempfile.TemporaryDirectory(prefix="gemma-vllm-bnb-") as temporary:
-        checkout = Path(temporary) / "source"
-        checkout.mkdir()
-        _run("git", "init", "--quiet", cwd=checkout)
-        _run("git", "remote", "add", "origin", VLLM_BNB_PLUGIN_REPOSITORY, cwd=checkout)
-        _run(
-            "git",
-            "fetch",
-            "--depth=1",
-            "origin",
-            VLLM_BNB_PLUGIN_COMMIT,
-            cwd=checkout,
-        )
-        _run("git", "checkout", "--quiet", "FETCH_HEAD", cwd=checkout)
-        _run(
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            "--no-deps",
-            "--no-build-isolation",
-            "--wheel-dir",
-            str(publish_dir),
-            ".",
-            cwd=checkout,
-        )
-        wheels = sorted(publish_dir.glob("vllm_bnb_plugin-*.whl"))
-        if len(wheels) != 1:
-            raise RuntimeError(f"Expected one vllm-bnb-plugin wheel, found {wheels}")
-        shutil.copy2(checkout / "LICENSE", publish_dir / "vllm-bnb-plugin-LICENSE")
-        return wheels[0]
 
 
 def _download_bitsandbytes_wheel(publish_dir: Path) -> Path:
@@ -123,7 +84,6 @@ def main() -> None:
         cwd=root,
     )
     (publish_dir / "commit.txt").write_text(commit + "\n", encoding="utf-8")
-    plugin_wheel = _build_vllm_bnb_plugin_wheel(publish_dir)
     bitsandbytes_wheel = _download_bitsandbytes_wheel(publish_dir)
     metadata = {
         "title": "Gemma GRPO source",
@@ -172,7 +132,6 @@ def main() -> None:
 
     print(f"{action}: https://www.kaggle.com/datasets/{args.dataset}")
     print(f"commit: {commit}")
-    print(f"offline NF4 plugin: {plugin_wheel.name} ({VLLM_BNB_PLUGIN_COMMIT[:12]})")
     print(f"offline bitsandbytes: {bitsandbytes_wheel.name} ({BITSANDBYTES_SHA256[:12]})")
 
 

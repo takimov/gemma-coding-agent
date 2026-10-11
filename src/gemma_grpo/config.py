@@ -26,7 +26,8 @@ class RolloutConfig:
     seeds: tuple[int, ...] = (101, 202, 303, 404)
     managed_vllm: bool = True
     vllm_port: int = 8000
-    vllm_tensor_parallel_size: int = 4
+    vllm_tensor_parallel_size: int = 1
+    vllm_pipeline_parallel_size: int = 4
     vllm_gpu_memory_utilization: float = 0.9
     vllm_startup_timeout_seconds: int = 900
 
@@ -163,6 +164,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("rollout.vllm_port must be a valid TCP port")
     if config.rollout.vllm_tensor_parallel_size < 1:
         raise ValueError("rollout.vllm_tensor_parallel_size must be positive")
+    if config.rollout.vllm_pipeline_parallel_size < 1:
+        raise ValueError("rollout.vllm_pipeline_parallel_size must be positive")
     if not 0 < config.rollout.vllm_gpu_memory_utilization < 1:
         raise ValueError("rollout.vllm_gpu_memory_utilization must be between 0 and 1")
     if config.rollout.vllm_startup_timeout_seconds < 1:
