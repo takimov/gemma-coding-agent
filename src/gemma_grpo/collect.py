@@ -221,9 +221,12 @@ def collect_rollouts(
             if not messages:
                 tool_calls = count_tool_calls(trace)
             outcome = score_result(result, patch=patch, tool_calls=tool_calls, config=config.reward)
+            # Raw SWEGemma stdout includes the rendered system/user prompts.
+            # Searching it would turn an instruction that mentions a budget
+            # error into a false exhaustion signal. Trace/result keep the
+            # structured tool or worker error and are the authoritative inputs.
             tool_budget_exhausted = any(
-                has_tool_budget_exhaustion(value)
-                for value in (trace, result, completed.stdout)
+                has_tool_budget_exhaustion(value) for value in (trace, result)
             )
             token_segments = (
                 trace_token_segments(trace)

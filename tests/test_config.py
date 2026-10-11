@@ -59,6 +59,15 @@ def test_qwen_teacher_config_discards_cross_tokenizer_ids():
     assert config.rollout.vllm_max_model_len == 32768
 
 
+def test_gemma_rollouts_use_full_agent_budget():
+    root = Path(__file__).parents[1]
+
+    for name in ("smoke.yaml", "grpo.yaml"):
+        config = load_config(root / "configs" / name)
+        assert config.rollout.max_tool_calls == 50
+        assert config.rollout.max_time_minutes == 15
+
+
 def test_mismatched_group_size_is_rejected(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text(

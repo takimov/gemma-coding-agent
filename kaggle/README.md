@@ -289,6 +289,11 @@ for task_id in SFT_TASK_IDS:
 subprocess.run(command, check=True, cwd=PROJECT)
 ```
 
+Это основной путь сбора через Gemma 4. `configs/grpo.yaml` и `submission`
+используют четыре одновременных seed, лимит 50 tool calls и 15 минут на seed.
+Траектория отбрасывается только при явной ошибке инструмента об исчерпании
+бюджета; текст system prompt сам по себе не влияет на классификацию.
+
 ### Сбор verified trajectories через Qwen3-Coder-Next
 
 Qwen используется только как offline teacher. Competition submission и
@@ -362,8 +367,8 @@ shim: SWEGemma/ADK добавляет `thinking_token_budget`, который vL
 принимает без `reasoning_config`. Это не включает thinking. Сырые Qwen token IDs
 также отключены: при дальнейшем SFT teacher messages заново токенизируются Gemma
 tokenizer. Оставляйте только `resolved=true`; failed teacher traces не становятся
-SFT targets. Teacher получает до 50 tool calls. Если trace содержит явный
-`BudgetExceeded`, collector помечает trajectory как `tool_budget_exhausted`,
+SFT targets. Teacher получает до 50 tool calls. Если tool result содержит явную
+ошибку исчерпания бюджета, collector помечает trajectory как `tool_budget_exhausted`,
 ставит `scorable=false` и не допускает её ни в GRPO, ни в SFT, даже если harness
 успел записать положительный verification result.
 

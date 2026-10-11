@@ -85,6 +85,11 @@ task IDs и увеличьте `--target-steps`. `--resume` продолжает
 `loop_state.json`; rollout с одинаковыми rewards автоматически пересэмплируется.
 Внешний `--models-yaml` допустим только при `rollout.managed_vllm: false`.
 
+Основной агент снова Gemma 4 (`submission`). Smoke и production дают каждому
+seed до 50 tool calls и 15 минут. Collector отбрасывает траекторию только при
+явной структурированной ошибке исчерпания tool budget; упоминание лимита в
+system prompt не считается ошибкой.
+
 ## Offline SFT вместо online GRPO
 
 SFT использует тот же NF4 checkpoint, FSDP и LoRA, но не требует групп reward,

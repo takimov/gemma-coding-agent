@@ -30,6 +30,34 @@ def test_tool_budget_exhaustion_is_found_in_nested_tool_result():
     assert not has_tool_budget_exhaustion({"error_type": "FileReadError"})
 
 
+def test_budget_marker_in_system_prompt_is_not_exhaustion():
+    trace = {
+        "agent": {"instruction": "Stop after a BudgetExceeded response."},
+        "messages": [
+            {
+                "role": "system",
+                "content": "Never continue after BudgetExceeded.",
+            },
+            {"role": "assistant", "content": "I will watch the tool budget."},
+        ],
+    }
+
+    assert not has_tool_budget_exhaustion(trace)
+
+
+def test_tool_budget_exhaustion_is_found_in_tool_message():
+    trace = {
+        "messages": [
+            {
+                "role": "tool",
+                "content": "Tool call budget exhausted",
+            }
+        ]
+    }
+
+    assert has_tool_budget_exhaustion(trace)
+
+
 def test_native_messages_are_preserved():
     trace = {
         "trajectory": {

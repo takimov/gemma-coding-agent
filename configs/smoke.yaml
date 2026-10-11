@@ -40,10 +40,10 @@ rollout:
   # Four independent SWEGemma sandboxes share one TP=4 vLLM server. Continuous
   # batching overlaps decoding with tool/test execution from the other seeds.
   concurrency: 4
-  # The earlier 5-call smoke exhausted its budget before submit_patch and
-  # produced only empty patches. Keep the real agent budget for a trainable group.
-  max_tool_calls: 20
-  max_time_minutes: 10
+  # Match the production agent budget. Trajectories that actually exhaust it
+  # are rejected by the collector instead of becoming negative RL examples.
+  max_tool_calls: 50
+  max_time_minutes: 15
   timeout_seconds: null
   seeds: [101, 202, 303, 404]
   managed_vllm: true

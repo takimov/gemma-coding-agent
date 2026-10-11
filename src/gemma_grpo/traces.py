@@ -13,17 +13,64 @@ TOOL_BUDGET_MARKERS = (
     "tool-call budget exhausted",
 )
 
+_ERROR_TEXT_KEYS = {
+    "error",
+    "error_message",
+    "error_type",
+    "exception",
+    "failure",
+    "status",
+}
+_TOOL_ROLES = {"tool", "environment", "observation", "tool_result"}
+
 
 def has_tool_budget_exhaustion(value: Any) -> bool:
-    """Detect an explicit SWEGemma tool-budget rejection in nested artifacts."""
-    if isinstance(value, str):
-        normalized = value.casefold()
+    """Detect an explicit SWEGemma tool-budget rejection.
+
+    Trace artifacts also contain system/user instructions. Searching every
+    string recursively makes a prompt that merely mentions a budget error look
+    exhausted. Only diagnostic fields and tool observations are evidence; a
+    top-level string remains supported for captured process output.
+    """
+
+    def contains_marker(text: Any) -> bool:
+        if not isinstance(text, str):
+            return False
+        normalized = text.casefold()
         return any(marker in normalized for marker in TOOL_BUDGET_MARKERS)
-    if isinstance(value, Mapping):
-        return any(has_tool_budget_exhaustion(child) for child in value.values())
-    if isinstance(value, list | tuple):
-        return any(has_tool_budget_exhaustion(child) for child in value)
-    return False
+
+    def inspect(current: Any) -> bool:
+        if isinstance(current, Mapping):
+            role = str(
+                current.get("role")
+                or current.get("source")
+                or current.get("type")
+                or ""
+            ).casefold()
+            for key, child in current.items():
+                normalized_key = str(key).casefold()
+                if normalized_key in _ERROR_TEXT_KEYS and contains_marker(child):
+                    return True
+                if role in _TOOL_ROLES and normalized_key in {
+                    "content",
+                    "message",
+                    "text",
+                    "output",
+                    "result",
+                    "observation",
+                }:
+                    if contains_marker(child):
+                        return True
+                if isinstance(child, Mapping | list | tuple) and inspect(child):
+                    return True
+            return False
+        if isinstance(current, list | tuple):
+            return any(inspect(child) for child in current)
+        return False
+
+    if isinstance(value, str):
+        return contains_marker(value)
+    return inspect(value)
 
 
 def _as_text(value: Any) -> str:
