@@ -28,6 +28,21 @@ def test_default_config_has_matching_group_and_seeds():
     assert config.grpo.monitor_interval_seconds == 5
 
 
+def test_sft_config_uses_safe_offline_defaults():
+    config = load_config(Path(__file__).parents[1] / "configs" / "sft.yaml")
+    assert config.sft.learning_rate == 1e-5
+    assert config.sft.epochs == 2
+    assert config.sft.max_seq_length == 8192
+    assert config.sft.max_examples_per_task == 2
+    assert config.distributed.strategy == "fsdp"
+    assert config.model.load_mode == "nf4"
+
+    smoke = load_config(Path(__file__).parents[1] / "configs" / "sft-smoke.yaml")
+    assert smoke.sft.max_steps == 1
+    assert smoke.sft.epochs == 1
+    assert smoke.lora.r == 8
+
+
 def test_mismatched_group_size_is_rejected(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text(

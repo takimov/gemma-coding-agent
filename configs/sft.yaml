@@ -1,0 +1,40 @@
+model:
+  # Persistent BF16-storage bitsandbytes NF4 checkpoint used by FSDP-QLoRA.
+  name_or_path: /kaggle/working/models/gemma-4-31b-nf4
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  load_mode: nf4
+  device_map: null
+
+distributed:
+  strategy: fsdp
+  num_processes: 4
+  cpu_offload: false
+  limit_all_gathers: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  exclude_modules: '.*vision_tower.*'
+
+sft:
+  learning_rate: 1.0e-5
+  epochs: 2
+  max_steps: null
+  max_seq_length: 8192
+  logprob_chunk_size: 32
+  max_grad_norm: 1.0
+  seed: 42
+  # Prevent four successful seeds of one easy task from dominating the learn.
+  max_examples_per_task: 2
+  monitor_interval_seconds: 5
+  monitor_console_seconds: 30
+
+# The shared config schema keeps these defaults for collect/preflight. SFT does
+# not use rewards, advantages, behavior logprobs, or the GRPO objective.
+grpo:
+  group_size: 4
+rollout:
+  seeds: [101, 202, 303, 404]

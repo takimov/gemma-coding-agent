@@ -11,6 +11,7 @@ from .loop import run_training_loop
 from .monitoring import summarize_telemetry
 from .nf4 import convert_to_nf4_checkpoint
 from .preflight import run_preflight
+from .sft import train_sft
 from .train import train_adapter
 from .vllm_server import rollout_models_yaml
 
@@ -44,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--adapter")
     collect.add_argument("--models-yaml")
     collect.add_argument("--model-path")
+    collect.add_argument(
+        "--skip-behavior-logprobs",
+        action="store_true",
+        help="skip GRPO-only W4 scoring when collecting trajectories for SFT",
+    )
 
     convert_nf4 = subparsers.add_parser(
         "convert-nf4",
@@ -60,6 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--output-dir", required=True)
     train.add_argument("--model-path")
     train.add_argument("--resume-adapter")
+
+    sft = subparsers.add_parser(
+        "sft", help="train QLoRA offline on verified successful or curated trajectories"
+    )
+    sft.add_argument("--config", default="configs/sft.yaml")
+    sft.add_argument("--trajectories", nargs="+", required=True)
+    sft.add_argument("--output-dir", required=True)
+    sft.add_argument("--model-path")
+    sft.add_argument("--resume-adapter")
 
     telemetry = subparsers.add_parser(
         "telemetry", help="summarize phase-level CPU/RAM/GPU training telemetry"
@@ -128,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
                 adapter=adapter,
                 models_yaml=models_yaml,
                 behavior_model_path=rollout_model_path,
+                capture_behavior_logprobs=not args.skip_behavior_logprobs,
             )
         summary = {
             "rollouts": len(rows),
@@ -153,6 +169,18 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=Path(args.output_dir).resolve(),
             model_path=args.model_path,
             resume_adapter=Path(args.resume_adapter).resolve() if args.resume_adapter else None,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "sft":
+        summary = train_sft(
+            config=load_config(args.config),
+            trajectory_paths=_paths(args.trajectories),
+            output_dir=Path(args.output_dir).resolve(),
+            model_path=args.model_path,
+            resume_adapter=(
+                Path(args.resume_adapter).resolve() if args.resume_adapter else None
+            ),
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0

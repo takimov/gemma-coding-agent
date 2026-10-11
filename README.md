@@ -34,6 +34,7 @@ NF4 относится к большим Linear-весам. Frozen embedding/lm_
 - `gemma-grpo preflight` — проверяет checkpoint, runtime shim, 4 GPU и версии;
 - `gemma-grpo collect` — запускает managed native W4 vLLM и собирает rollout-группу;
 - `gemma-grpo train` — один FSDP-QLoRA GRPO update;
+- `gemma-grpo sft` — offline FSDP-QLoRA по успешным или вручную одобренным траекториям;
 - `gemma-grpo loop` — непрерывно чередует collect/train до целевого числа steps;
 - `gemma-grpo telemetry` — агрегирует GPU/CPU/RAM telemetry;
 - `gemma-grpo export` — собирает submission ZIP с LoRA adapter.
@@ -83,6 +84,47 @@ gemma-grpo loop \
 task IDs и увеличьте `--target-steps`. `--resume` продолжает атомарно сохранённый
 `loop_state.json`; rollout с одинаковыми rewards автоматически пересэмплируется.
 Внешний `--models-yaml` допустим только при `rollout.managed_vllm: false`.
+
+## Offline SFT вместо online GRPO
+
+SFT использует тот же NF4 checkpoint, FSDP и LoRA, но не требует групп reward,
+behavior/reference log-probabilities или повторного запуска vLLM между шагами.
+В learn автоматически входят только строки с `resolved=true` и успешным
+scoring. Вручную проверенную teacher-траекторию можно добавить с
+`sft_approved=true`; обычные `tests_failed` и `empty_patch` игнорируются.
+
+При сборе данных для SFT отключите ненужный GRPO scoring pass:
+
+```bash
+gemma-grpo collect \
+  --config configs/grpo.yaml \
+  --tasks /path/to/tasks.jsonl \
+  --snapshots-dir /path/to/snapshots \
+  --submission-dir submission \
+  --model-path /path/to/gemma-4-31b-it-qat-w4a16-ct \
+  --output runs/sft-data/rollouts.jsonl \
+  --results-root runs/sft-data/results \
+  --iteration 0 \
+  --skip-behavior-logprobs \
+  --task-id TASK_A --task-id TASK_B --task-id TASK_C
+```
+
+Затем обучите adapter сразу на нескольких ранее собранных JSONL:
+
+```bash
+gemma-grpo sft \
+  --config configs/sft.yaml \
+  --trajectories runs/*/rollouts.jsonl \
+  --output-dir runs/sft-adapter-v1 \
+  --model-path /path/to/gemma-4-31b-nf4
+```
+
+Loss — token-mean negative log-likelihood только по assistant/action tokens.
+User/system/tool-output токены остаются контекстом, но не являются targets.
+Точные дубли удаляются, а `sft.max_examples_per_task` не позволяет одной лёгкой
+задаче занять learn всеми четырьмя seed'ами. Последний неполный global batch не
+отбрасывается: свободные FSDP ranks выполняют синхронизированный zero-loss
+forward.
 
 ## Что считается в GRPO
 

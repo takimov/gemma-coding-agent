@@ -228,6 +228,85 @@ Managed server передаёт Gemma 4 reasoning boundaries (`<|channel>` и
 `<channel|>`) через `--reasoning-config`, поэтому запросы SWEGemma с
 `thinking_token_budget` принимаются vLLM 0.19.1.
 
+## Быстрый offline SFT
+
+SFT полезен, когда online GRPO слишком дорог: rollout'ы собираются один раз,
+после чего все optimizer steps выполняются подряд без vLLM. Нельзя обучаться на
+неуспешных траекториях автоматически — команда принимает только
+`resolved=true` либо вручную проверенные строки с `sft_approved=true`.
+
+Сначала можно использовать уже накопленные JSONL и проверить объём learn:
+
+```python
+rollout_paths = sorted(Path("/kaggle/working/runs").rglob("rollouts.jsonl"))
+rows = [
+    json.loads(line)
+    for path in rollout_paths
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+approved = [
+    row for row in rows
+    if (row.get("resolved") is True and row.get("scorable", True) is not False)
+    or row.get("sft_approved") is True
+]
+print("trajectory files:", len(rollout_paths))
+print("rows:", len(rows))
+print("approved for SFT:", len(approved))
+print("tasks:", len({row.get("task_id") for row in approved}))
+assert approved, "Пока нет ни одной успешной/одобренной траектории для SFT"
+```
+
+Если данных мало, соберите несколько задач одним запуском vLLM. Флаг
+`--skip-behavior-logprobs` убирает W4 scoring pass, который нужен GRPO, но не
+SFT:
+
+```python
+SFT_TASK_IDS = [
+    # Добавьте разные instance_id из tasks.jsonl.
+    "requests_7505",
+]
+sft_data_dir = Path("/kaggle/working/runs/sft-data-v1")
+command = [
+    "gemma-grpo", "collect",
+    "--config", str(PROJECT / "configs/grpo.yaml"),
+    "--tasks", str(data_root / "tasks.jsonl"),
+    "--snapshots-dir", str(data_root / "snapshots"),
+    "--submission-dir", str(PROJECT / "submission"),
+    "--model-path", str(source_w4),
+    "--results-root", str(sft_data_dir / "results"),
+    "--output", str(sft_data_dir / "rollouts.jsonl"),
+    "--iteration", "0",
+    "--skip-behavior-logprobs",
+]
+for task_id in SFT_TASK_IDS:
+    command.extend(["--task-id", task_id])
+subprocess.run(command, check=True, cwd=PROJECT)
+```
+
+Обучение по всем накопленным JSONL (global batch равен четырём GPU):
+
+```python
+rollout_paths = sorted(Path("/kaggle/working/runs").rglob("rollouts.jsonl"))
+SFT_OUTPUT = Path("/kaggle/working/runs/sft-adapter-v1")
+command = [
+    "gemma-grpo", "sft",
+    # Первый запуск: sft-smoke.yaml (ровно один step). После него: sft.yaml.
+    "--config", str(PROJECT / "configs/sft-smoke.yaml"),
+    "--trajectories", *map(str, rollout_paths),
+    "--output-dir", str(SFT_OUTPUT),
+    "--model-path", str(NF4_DIR),
+]
+subprocess.run(command, check=True, cwd=PROJECT)
+print(json.loads((SFT_OUTPUT / "training_metrics.json").read_text()))
+```
+
+Production-конфиг `configs/sft.yaml` использует две эпохи,
+`max_seq_length=8192`, LoRA rank 16 и не более двух уникальных траекторий с
+одной задачи. Готовый `configs/sft-smoke.yaml` делает ровно один step с rank 8;
+после успешного smoke создайте новый output directory и переключитесь на
+`configs/sft.yaml`.
+
 ## Ячейка 4 — обязательный smoke
 
 ```python

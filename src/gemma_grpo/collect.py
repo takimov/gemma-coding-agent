@@ -127,6 +127,7 @@ def collect_rollouts(
     adapter: Path | None = None,
     models_yaml: Path | None = None,
     behavior_model_path: Path | None = None,
+    capture_behavior_logprobs: bool = True,
 ) -> list[dict[str, Any]]:
     tasks = select_tasks(read_jsonl(tasks_path), selected_ids)
     policy_id = adapter_fingerprint(adapter) if adapter is not None else "base"
@@ -261,6 +262,7 @@ def collect_rollouts(
     if (
         config.rollout.managed_vllm
         and config.rollout.vllm_checkpoint_format == "compressed-tensors"
+        and capture_behavior_logprobs
     ):
         if behavior_model_path is None:
             raise ValueError(

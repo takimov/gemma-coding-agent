@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,20 @@ class GrpoConfig:
 
 
 @dataclass(frozen=True)
+class SftConfig:
+    learning_rate: float = 1e-5
+    epochs: int = 2
+    max_steps: int | None = None
+    max_seq_length: int = 8192
+    logprob_chunk_size: int = 32
+    max_grad_norm: float = 1.0
+    seed: int = 42
+    max_examples_per_task: int | None = 2
+    monitor_interval_seconds: float = 5.0
+    monitor_console_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class LoraConfigData:
     r: int = 16
     alpha: int = 32
@@ -90,6 +104,7 @@ class ExperimentConfig:
     rollout: RolloutConfig
     reward: RewardConfig
     distributed: DistributedConfig
+    sft: SftConfig = field(default_factory=SftConfig)
 
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
@@ -114,6 +129,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         model=ModelConfig(**model_raw),
         lora=LoraConfigData(**_section(raw, "lora")),
         grpo=GrpoConfig(**_section(raw, "grpo")),
+        sft=SftConfig(**_section(raw, "sft")),
         rollout=RolloutConfig(**rollout_raw),
         reward=RewardConfig(**_section(raw, "reward")),
         distributed=DistributedConfig(**_section(raw, "distributed")),
@@ -139,6 +155,25 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("grpo.monitor_interval_seconds must be positive")
     if config.grpo.monitor_console_seconds <= 0:
         raise ValueError("grpo.monitor_console_seconds must be positive")
+    if config.sft.epochs < 1:
+        raise ValueError("sft.epochs must be at least 1")
+    if config.sft.max_steps is not None and config.sft.max_steps < 1:
+        raise ValueError("sft.max_steps must be positive when set")
+    if config.sft.max_seq_length < 2:
+        raise ValueError("sft.max_seq_length must be at least 2")
+    if config.sft.logprob_chunk_size < 1:
+        raise ValueError("sft.logprob_chunk_size must be positive")
+    if config.sft.max_grad_norm <= 0:
+        raise ValueError("sft.max_grad_norm must be positive")
+    if (
+        config.sft.max_examples_per_task is not None
+        and config.sft.max_examples_per_task < 1
+    ):
+        raise ValueError("sft.max_examples_per_task must be positive when set")
+    if config.sft.monitor_interval_seconds <= 0:
+        raise ValueError("sft.monitor_interval_seconds must be positive")
+    if config.sft.monitor_console_seconds <= 0:
+        raise ValueError("sft.monitor_console_seconds must be positive")
     if not 0 < config.lora.r <= 128:
         raise ValueError("lora.r must be between 1 and the competition maximum of 128")
     if config.lora.dropout != 0.0:
