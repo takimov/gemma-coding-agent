@@ -107,10 +107,17 @@ model_dir = next(
 shutil.rmtree(PROJECT, ignore_errors=True)
 
 source_archives = list(INPUT.rglob("gemma-grpo-kaggle.zip"))
+source_directories = [
+    path for path in INPUT.rglob("gemma-grpo-kaggle") if path.is_dir()
+]
 if source_archives:
     PROJECT.mkdir(parents=True)
     with zipfile.ZipFile(source_archives[0]) as archive:
         archive.extractall(PROJECT)
+elif source_directories:
+    # Kaggle commonly expands an uploaded ZIP and mounts it as a directory
+    # whose name no longer has the .zip suffix.
+    shutil.copytree(source_directories[0], PROJECT)
 else:
     source_root = next(
         path.parent
@@ -118,6 +125,10 @@ else:
         if "gemma-swegemma-grpo" in path.read_text(encoding="utf-8")
     )
     shutil.copytree(source_root, PROJECT)
+
+assert (PROJECT / "pyproject.toml").is_file(), (
+    f"Source was not materialized correctly under {PROJECT}"
+)
 
 # The official host wheelhouse is a self-contained, mutually compatible bundle.
 # Install all of it instead of naming vLLM dependencies one by one.  The
