@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +22,14 @@ from .nf4 import assert_nf4_checkpoint
 BASE_MODEL_ALIAS = "gemma-4-31b-it-qat-w4a16-ct"
 ADAPTER_ALIAS = "main_lora"
 VLLM_COMPAT_SITE = Path(__file__).with_name("_vllm_site")
+
+
+def _tee_stream(source: TextIO, *destinations: TextIO) -> None:
+    """Forward a child stream live while retaining an on-disk copy."""
+    for line in source:
+        for destination in destinations:
+            destination.write(line)
+            destination.flush()
 
 
 def vllm_environment() -> dict[str, str]:
@@ -75,6 +84,7 @@ class ManagedVllmServer:
         self.work_dir = work_dir.resolve()
         self.process: subprocess.Popen[str] | None = None
         self._log_handle: TextIO | None = None
+        self._log_thread: threading.Thread | None = None
         self.log_path = self.work_dir / "vllm.log"
         self.models_yaml = self.work_dir / "models.yaml"
 
@@ -196,11 +206,20 @@ class ManagedVllmServer:
         self.process = subprocess.Popen(
             command,
             text=True,
-            stdout=self._log_handle,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            bufsize=1,
             env=environment,
             start_new_session=True,
         )
+        assert self.process.stdout is not None
+        self._log_thread = threading.Thread(
+            target=_tee_stream,
+            args=(self.process.stdout, self._log_handle, sys.stdout),
+            name="vllm-log-tee",
+            daemon=True,
+        )
+        self._log_thread.start()
         deadline = time.monotonic() + self.config.rollout.vllm_startup_timeout_seconds
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -229,6 +248,9 @@ class ManagedVllmServer:
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=15)
+        if self._log_thread is not None:
+            self._log_thread.join(timeout=15)
+            self._log_thread = None
         if self._log_handle is not None:
             self._log_handle.close()
             self._log_handle = None

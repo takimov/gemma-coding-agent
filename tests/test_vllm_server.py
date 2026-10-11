@@ -1,3 +1,5 @@
+from io import StringIO
+
 import yaml
 
 from gemma_grpo.config import load_config
@@ -6,9 +8,21 @@ from gemma_grpo.vllm_server import (
     BASE_MODEL_ALIAS,
     ManagedVllmServer,
     VLLM_COMPAT_SITE,
+    _tee_stream,
     vllm_environment,
     write_models_yaml,
 )
+
+
+def test_tee_stream_forwards_and_retains_all_output():
+    source = StringIO("first\nsecond\n")
+    log = StringIO()
+    console = StringIO()
+
+    _tee_stream(source, log, console)
+
+    assert log.getvalue() == "first\nsecond\n"
+    assert console.getvalue() == log.getvalue()
 
 
 def test_models_yaml_routes_base_and_adapter_to_managed_server(tmp_path):

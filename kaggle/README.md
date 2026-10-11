@@ -209,6 +209,8 @@ Managed server также включает `--language-model-only`: SWEGemma cod
 Rollout context остаётся 32768 независимо от `grpo.max_seq_length`: smoke
 фильтрует обучающие траектории по 8192, но SWEGemma запрашивает до 16384 новых
 токенов у inference server.
+Вывод managed vLLM одновременно показывается в stdout notebook и сохраняется в
+`<run>/vllm/collection_NNNN/vllm.log`.
 
 ## Ячейка 4 — обязательный smoke
 
