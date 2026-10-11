@@ -134,6 +134,9 @@ def run_preflight(
             agent = yaml.load(
                 (submission_dir / "agent.yaml").read_text(encoding="utf-8"), Loader=_IncludeLoader
             )
+            sampling = yaml.safe_load(
+                (submission_dir / "configs" / "sampling.yaml").read_text(encoding="utf-8")
+            )
             tools = agent.get("tools", []) if isinstance(agent, dict) else []
             name = agent.get("name") if isinstance(agent, dict) else None
             record(
@@ -146,6 +149,24 @@ def run_preflight(
                 "submission tools",
                 not unknown_tools,
                 "ok" if not unknown_tools else f"not in SWEGemma registry: {unknown_tools}",
+            )
+            max_output_tokens = (
+                sampling.get("max_output_tokens") if isinstance(sampling, dict) else None
+            )
+            max_safe_output = config.rollout.vllm_max_model_len // 4
+            output_budget_ok = (
+                isinstance(max_output_tokens, int)
+                and not isinstance(max_output_tokens, bool)
+                and 0 < max_output_tokens <= max_safe_output
+            )
+            record(
+                "rollout output-token headroom",
+                output_budget_ok,
+                (
+                    f"max_output_tokens={max_output_tokens}; "
+                    f"required <= {max_safe_output} for "
+                    f"vLLM context {config.rollout.vllm_max_model_len}"
+                ),
             )
             eval_config = yaml.safe_load(
                 (submission_dir / "eval_config.yaml").read_text(encoding="utf-8")
