@@ -13,9 +13,10 @@ Notebook работает с выключенным Internet. Managed loop ис�
 python scripts/publish_kaggle_dataset.py
 ```
 
-Publisher архивирует Git `HEAD`, пишет `commit.txt` и собирает зафиксированный
-официальный `vllm-bnb-plugin` wheel. Он обязателен: в vLLM 0.19.1 NF4/BnB
-поддержка вынесена из основного пакета. Dataset по умолчанию:
+Publisher архивирует Git `HEAD`, пишет `commit.txt`, собирает зафиксированный
+официальный `vllm-bnb-plugin` wheel и скачивает проверенный по SHA256 Linux-wheel
+`bitsandbytes==0.48.1`. Plugin обязателен: в vLLM 0.19.1 NF4/BnB поддержка
+вынесена из основного пакета. Dataset по умолчанию:
 `timurakimoff/gemma-grpo-source`.
 
 ## Inputs
@@ -46,6 +47,8 @@ PROJECT = Path("/kaggle/working/gemma-grpo")
 
 wheel_dir = next(INPUT.rglob("swegemma-*.whl")).parent
 plugin_wheel = next(INPUT.rglob("vllm_bnb_plugin-*.whl"))
+asset_root = plugin_wheel.parent
+bnb_wheel = next(asset_root.glob("bitsandbytes-0.48.1-*.whl"))
 data_root = next(
     path.parent
     for path in INPUT.rglob("tasks.jsonl")
@@ -58,16 +61,27 @@ source_w4 = next(
 )
 
 shutil.rmtree(PROJECT, ignore_errors=True)
-archives = list(INPUT.rglob("gemma-grpo-kaggle.zip"))
-directories = [path for path in INPUT.rglob("gemma-grpo-kaggle") if path.is_dir()]
-if archives:
+repo_roots = [
+    path.parent
+    for path in asset_root.rglob("pyproject.toml")
+    if (path.parent / "src" / "gemma_grpo").is_dir()
+]
+archives = [
+    path
+    for path in asset_root.iterdir()
+    if path.is_file()
+    and path.suffix != ".whl"
+    and zipfile.is_zipfile(path)
+]
+if repo_roots:
+    source_root = min(repo_roots, key=lambda path: len(path.parts))
+    shutil.copytree(source_root, PROJECT)
+elif archives:
     PROJECT.mkdir(parents=True)
     with zipfile.ZipFile(archives[0]) as archive:
         archive.extractall(PROJECT)
-elif directories:
-    shutil.copytree(directories[0], PROJECT)
 else:
-    raise FileNotFoundError("gemma-grpo source archive is not attached")
+    raise FileNotFoundError(f"gemma-grpo source is missing under {asset_root}")
 assert (PROJECT / "pyproject.toml").is_file(), PROJECT
 
 # Убираем конфликтующий cutlass bootstrap и устанавливаем полный официальный
@@ -103,6 +117,13 @@ subprocess.run(
 subprocess.run(
     [
         sys.executable, "-m", "pip", "install", "-q", "--no-deps",
+        "--force-reinstall", str(bnb_wheel),
+    ],
+    check=True,
+)
+subprocess.run(
+    [
+        sys.executable, "-m", "pip", "install", "-q", "--no-deps",
         "--force-reinstall", str(plugin_wheel),
     ],
     check=True,
@@ -115,11 +136,12 @@ subprocess.run(
     check=True,
 )
 
-commit_file = next(INPUT.rglob("commit.txt"))
+commit_file = asset_root / "commit.txt"
 print("project:", PROJECT)
 print("commit:", commit_file.read_text().strip())
 print("source W4:", source_w4)
 print("competition data:", data_root)
+print("bitsandbytes:", bnb_wheel.name)
 print("NF4 plugin:", plugin_wheel.name)
 ```
 

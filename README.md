@@ -104,9 +104,11 @@ pip install --no-build-isolation -e '.[dev,train]'
 PYTHONPATH=src pytest -q
 ```
 
-В Kaggle vLLM 0.19+ требует отдельный `vllm-bnb-plugin`. Publisher кладёт
-зафиксированный официальный plugin wheel в private source dataset, потому что
-Internet с L4×4 выключен. Без этого wheel preflight завершится до загрузки 31B.
+В Kaggle vLLM 0.19+ требует отдельный `vllm-bnb-plugin`, а competition
+wheelhouse содержит слишком старый `bitsandbytes`. Publisher кладёт
+зафиксированный официальный plugin wheel и проверенный Linux-wheel
+`bitsandbytes==0.48.1` в private source dataset, потому что Internet с L4×4
+выключен. Без них preflight завершится до загрузки 31B.
 
 Подробные готовые notebook cells находятся в
 [`kaggle/README.md`](kaggle/README.md), а допущения и остаточные риски — в

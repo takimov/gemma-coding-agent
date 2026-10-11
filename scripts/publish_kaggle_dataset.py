@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -14,6 +15,8 @@ VLLM_BNB_PLUGIN_REPOSITORY = "https://github.com/vllm-project/vllm-bnb-plugin.gi
 # Pin the official plugin so an offline Kaggle run is reproducible even when
 # the repository's main branch moves independently of the competition image.
 VLLM_BNB_PLUGIN_COMMIT = "d4914a9e3c5927b33b7ef941385a4fda2187e2b9"
+BITSANDBYTES_VERSION = "0.48.1"
+BITSANDBYTES_SHA256 = "3e72cf07ba6d2169e69a61282a6f072fc675efee86049e56a33de099a0363ef2"
 
 
 def _run(*args: str, cwd: Path, capture: bool = False) -> str:
@@ -61,6 +64,34 @@ def _build_vllm_bnb_plugin_wheel(publish_dir: Path) -> Path:
         return wheels[0]
 
 
+def _download_bitsandbytes_wheel(publish_dir: Path) -> Path:
+    """Download the pinned Linux wheel required by the offline Kaggle image."""
+    _run(
+        sys.executable,
+        "-m",
+        "pip",
+        "download",
+        "--no-deps",
+        "--only-binary=:all:",
+        "--platform=manylinux_2_24_x86_64",
+        "--python-version=3.12",
+        "--implementation=cp",
+        f"--dest={publish_dir}",
+        f"bitsandbytes=={BITSANDBYTES_VERSION}",
+        cwd=publish_dir,
+    )
+    wheels = sorted(publish_dir.glob(f"bitsandbytes-{BITSANDBYTES_VERSION}-*.whl"))
+    if len(wheels) != 1:
+        raise RuntimeError(f"Expected one bitsandbytes wheel, found {wheels}")
+    digest = hashlib.sha256(wheels[0].read_bytes()).hexdigest()
+    if digest != BITSANDBYTES_SHA256:
+        raise RuntimeError(
+            f"Unexpected SHA256 for {wheels[0].name}: {digest}; "
+            f"expected {BITSANDBYTES_SHA256}"
+        )
+    return wheels[0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Publish the committed project as a private Kaggle Dataset."
@@ -93,6 +124,7 @@ def main() -> None:
     )
     (publish_dir / "commit.txt").write_text(commit + "\n", encoding="utf-8")
     plugin_wheel = _build_vllm_bnb_plugin_wheel(publish_dir)
+    bitsandbytes_wheel = _download_bitsandbytes_wheel(publish_dir)
     metadata = {
         "title": "Gemma GRPO source",
         "id": args.dataset,
@@ -141,6 +173,7 @@ def main() -> None:
     print(f"{action}: https://www.kaggle.com/datasets/{args.dataset}")
     print(f"commit: {commit}")
     print(f"offline NF4 plugin: {plugin_wheel.name} ({VLLM_BNB_PLUGIN_COMMIT[:12]})")
+    print(f"offline bitsandbytes: {bitsandbytes_wheel.name} ({BITSANDBYTES_SHA256[:12]})")
 
 
 if __name__ == "__main__":
