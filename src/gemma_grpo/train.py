@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import ExperimentConfig
 from .groups import add_group_advantages, trainable_groups
+from .monitoring import TrainingMonitor
 from .objective import grpo_loss
 from .policy import adapter_fingerprint
 from .tasks import read_jsonl
@@ -110,18 +111,8 @@ def _no_split_module_classes(model: Any) -> list[str] | None:
     return sorted(names) or None
 
 
-def _load_model_and_tokenizer(
-    config: ExperimentConfig, model_path: str | None, resume_adapter: Path | None
-):
-    import torch
-    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-    from transformers import (
-        AutoConfig,
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        BitsAndBytesConfig,
-        CompressedTensorsConfig,
-    )
+def _load_tokenizer(config: ExperimentConfig, model_path: str | None):
+    from transformers import AutoTokenizer
 
     path = model_path or config.model.name_or_path
     tokenizer = AutoTokenizer.from_pretrained(
@@ -129,6 +120,35 @@ def _load_model_and_tokenizer(
         trust_remote_code=config.model.trust_remote_code,
     )
     assert_prefix_preserving(tokenizer)
+    return tokenizer
+
+
+def _load_model_and_tokenizer(
+    config: ExperimentConfig,
+    model_path: str | None,
+    resume_adapter: Path | None,
+    *,
+    tokenizer: Any | None = None,
+    monitor: TrainingMonitor | None = None,
+):
+    import torch
+    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        BitsAndBytesConfig,
+        CompressedTensorsConfig,
+    )
+
+    path = model_path or config.model.name_or_path
+
+    def phase(name: str) -> None:
+        if monitor is not None:
+            monitor.set_phase(name)
+
+    if tokenizer is None:
+        phase("load_tokenizer")
+        tokenizer = _load_tokenizer(config, model_path)
 
     dtype = getattr(torch, config.model.torch_dtype)
     checkpoint_config = AutoConfig.from_pretrained(
@@ -187,8 +207,10 @@ def _load_model_and_tokenizer(
             load_kwargs["quantization_config"] = CompressedTensorsConfig(
                 run_compressed=False
             )
+    phase("load_checkpoint_cpu" if stage_compressed_on_cpu else "load_checkpoint")
     model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
     if requantize_compressed_to_bnb4:
+        phase("requantize_nf4")
         print("[train] converting decompressed CPU model to bitsandbytes NF4")
         model = _requantize_linears_to_bnb4(model, dtype)
         model.config.quantization_config = BitsAndBytesConfig(
@@ -198,14 +220,17 @@ def _load_model_and_tokenizer(
             bnb_4bit_use_double_quant=True,
         ).to_dict()
     if config.model.load_mode == "bnb4":
+        phase("prepare_kbit")
         model = prepare_model_for_kbit_training(model)
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     if resume_adapter is not None:
+        phase("load_lora")
         model = PeftModel.from_pretrained(model, resume_adapter, is_trainable=True)
     else:
+        phase("inject_lora")
         model = get_peft_model(
             model,
             LoraConfig(
@@ -224,14 +249,28 @@ def _load_model_and_tokenizer(
         # Decompression needs a packed tensor, a temporary unpacked tensor, and
         # the final bf16 tensor at the same time. Staging on CPU avoids that VRAM
         # peak. In bnb4 mode the dense layers are then requantized one at a time,
-        # before dispatch. Reserve at least 4 GiB per GPU for training state.
+        # before dispatch. GPU 0 owns the embeddings/lm_head and receives every
+        # vocabulary projection, so it needs more activation headroom than the
+        # GPUs which only own decoder blocks.
         max_memory: dict[int | str, str] = {}
         for index in range(torch.cuda.device_count()):
             physical_gib = torch.cuda.get_device_properties(index).total_memory // (1024**3)
+            reserve_gib = (
+                config.model.gpu0_reserve_gib
+                if index == 0
+                else config.model.other_gpu_reserve_gib
+            )
+            if reserve_gib >= physical_gib:
+                raise ValueError(
+                    f"GPU {index} reserve ({reserve_gib} GiB) must be smaller than "
+                    f"its physical memory ({physical_gib} GiB)"
+                )
             requested_gib = config.model.max_memory_per_gpu_gib or physical_gib
-            weight_budget_gib = min(requested_gib, max(1, physical_gib - 4))
+            weight_budget_gib = min(requested_gib, physical_gib - reserve_gib)
             max_memory[index] = f"{weight_budget_gib}GiB"
+        print(f"[train] GPU weight-memory budgets: {max_memory}", flush=True)
         max_memory["cpu"] = "150GiB"
+        phase("infer_device_map")
         no_split = _no_split_module_classes(model)
         balanced_memory = get_balanced_memory(
             model,
@@ -256,15 +295,8 @@ def _load_model_and_tokenizer(
                 f"CPU/disk assignments include: {offloaded[:5]}"
             )
         print(f"[train] dispatching decompressed model with device map: {device_map}")
-        # Gemma applies tensor-valued logits_to_keep before lm_head.  CPU index
-        # tensors are valid for CUDA advanced indexing; prevent the root
-        # Accelerate hook from moving this kwarg to the main device (cuda:0),
-        # because the final hidden state may live on another GPU.
-        model = dispatch_model(
-            model,
-            device_map=device_map,
-            skip_keys=["logits_to_keep"],
-        )
+        phase("dispatch_model")
+        model = dispatch_model(model, device_map=device_map)
     return model, tokenizer
 
 
@@ -272,23 +304,69 @@ def _embedding_device(model: Any):
     return model.get_input_embeddings().weight.device
 
 
-def _cpu_logit_positions(action_positions: list[int]):
-    """Build CPU indices that remain valid for a model-parallel hidden state."""
+def _causal_lm_parts(model: Any) -> tuple[Any, Any, float | None]:
+    causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
+    backbone = getattr(causal_lm, "model", None)
+    output_head = causal_lm.get_output_embeddings()
+    if backbone is None or output_head is None:
+        raise RuntimeError(
+            "The loaded causal LM must expose .model and get_output_embeddings() "
+            "for memory-bounded action log-probabilities"
+        )
+    text_config = causal_lm.config
+    if hasattr(text_config, "get_text_config"):
+        text_config = text_config.get_text_config()
+    softcap = getattr(text_config, "final_logit_softcapping", None)
+    return backbone, output_head, float(softcap) if softcap is not None else None
+
+
+def _project_action_logprobs(
+    output_head: Any,
+    selected_hidden: Any,
+    labels: Any,
+    *,
+    chunk_size: int,
+    final_logit_softcapping: float | None = None,
+):
+    """Project hidden states to token log-probs without a full action×vocab tensor."""
     import torch
+    from torch.utils.checkpoint import checkpoint
 
-    return torch.tensor(
-        [position - 1 for position in action_positions],
-        dtype=torch.long,
-        device="cpu",
-    )
+    def project(hidden_chunk, label_chunk):
+        logits = output_head(hidden_chunk)
+        if final_logit_softcapping is not None:
+            logits = torch.tanh(logits / final_logit_softcapping)
+            logits = logits * final_logit_softcapping
+        return (
+            torch.log_softmax(logits.float(), dim=-1)
+            .gather(-1, label_chunk.to(logits.device).unsqueeze(-1))
+            .squeeze(-1)
+        )
+
+    chunks = []
+    for start in range(0, selected_hidden.shape[1], chunk_size):
+        end = min(start + chunk_size, selected_hidden.shape[1])
+        hidden_chunk = selected_hidden[:, start:end, :]
+        label_chunk = labels[:, start:end]
+        if torch.is_grad_enabled() and hidden_chunk.requires_grad:
+            values = checkpoint(
+                project,
+                hidden_chunk,
+                label_chunk,
+                use_reentrant=False,
+            )
+        else:
+            values = project(hidden_chunk, label_chunk)
+        chunks.append(values)
+    return torch.cat(chunks, dim=1).squeeze(0)
 
 
-def _supports_selective_logits(model: Any) -> bool:
-    signature = inspect.signature(model.get_base_model().forward)
-    return "logits_to_keep" in signature.parameters
-
-
-def _selected_logprobs(model: Any, tokenized: TokenizedTrajectory):
+def _selected_logprobs(
+    model: Any,
+    tokenized: TokenizedTrajectory,
+    *,
+    chunk_size: int,
+):
     import torch
 
     input_device = _embedding_device(model)
@@ -296,50 +374,85 @@ def _selected_logprobs(model: Any, tokenized: TokenizedTrajectory):
     target_positions = torch.tensor(
         tokenized.action_positions, dtype=torch.long, device=input_device
     )
-    kwargs: dict[str, Any] = {"input_ids": input_ids, "use_cache": False}
-    base_signature = inspect.signature(model.get_base_model().forward)
-    if "logits_to_keep" in base_signature.parameters:
-        logit_positions = _cpu_logit_positions(tokenized.action_positions)
-        kwargs["logits_to_keep"] = logit_positions
-    elif "num_logits_to_keep" in base_signature.parameters:
-        # Older model implementations only support a suffix. It is correct only
-        # when all selected targets lie in that suffix, so fall back to full logits.
-        logit_positions = target_positions - 1
-    else:
-        logit_positions = target_positions - 1
-    outputs = model(**kwargs)
-    logits = outputs.logits
-    logit_positions = logit_positions.to(logits.device)
-    if logits.shape[1] == len(logit_positions):
-        selected_logits = logits
-    else:
-        selected_logits = logits.index_select(1, logit_positions)
-    labels = input_ids.index_select(1, target_positions).to(selected_logits.device)
-    return torch.log_softmax(selected_logits.float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(0).squeeze(-1)
+    backbone, output_head, final_logit_softcapping = _causal_lm_parts(model)
+    outputs = backbone(input_ids=input_ids, use_cache=False)
+    hidden_states = outputs.last_hidden_state
+    logit_positions = (target_positions - 1).to(hidden_states.device)
+    selected_hidden = hidden_states.index_select(1, logit_positions)
+    labels = input_ids.index_select(1, target_positions)
+    return _project_action_logprobs(
+        output_head,
+        selected_hidden,
+        labels,
+        chunk_size=chunk_size,
+        final_logit_softcapping=final_logit_softcapping,
+    )
 
 
-def _rollout_logprobs(model: Any, segments: list[TokenizedTrajectory]):
+def _rollout_logprobs(
+    model: Any,
+    segments: list[TokenizedTrajectory],
+    *,
+    chunk_size: int,
+):
     import torch
 
-    return torch.cat([_selected_logprobs(model, segment) for segment in segments])
+    return torch.cat(
+        [_selected_logprobs(model, segment, chunk_size=chunk_size) for segment in segments]
+    )
+
+
+def _validate_trajectory(trajectory: TokenizedTrajectory) -> TokenizedTrajectory:
+    positions = trajectory.action_positions
+    if not trajectory.input_ids:
+        raise ValueError("Tokenized trajectory has no input tokens")
+    if not positions:
+        raise ValueError("Tokenized trajectory has no action tokens")
+    if positions != sorted(set(positions)):
+        raise ValueError("Action positions must be unique and sorted")
+    if positions[0] <= 0 or positions[-1] >= len(trajectory.input_ids):
+        raise ValueError(
+            "Action positions must be between 1 and len(input_ids)-1; "
+            f"got range {positions[0]}..{positions[-1]} for {len(trajectory.input_ids)} tokens"
+        )
+    return trajectory
 
 
 def _row_segments(tokenizer: Any, row: dict[str, Any]) -> list[TokenizedTrajectory]:
     raw_segments = row.get("token_segments")
     if isinstance(raw_segments, list) and raw_segments:
         return [
-            TokenizedTrajectory(
-                input_ids=[int(token) for token in segment["input_ids"]],
-                action_positions=[int(position) for position in segment["action_positions"]],
+            _validate_trajectory(
+                TokenizedTrajectory(
+                    input_ids=[int(token) for token in segment["input_ids"]],
+                    action_positions=[
+                        int(position) for position in segment["action_positions"]
+                    ],
+                )
             )
             for segment in raw_segments
         ]
-    return [tokenize_trajectory(tokenizer, row["messages"], row.get("tools"))]
+    return [
+        _validate_trajectory(
+            tokenize_trajectory(tokenizer, row["messages"], row.get("tools"))
+        )
+    ]
 
 
 def _disable_adapter(model: Any):
     method = getattr(model, "disable_adapter", None)
     return method() if method is not None else nullcontext()
+
+
+def _next_telemetry_path(output_dir: Path) -> Path:
+    base = output_dir.parent / f"{output_dir.name}.telemetry.jsonl"
+    if not base.exists():
+        return base
+    for version in range(2, 10_000):
+        candidate = output_dir.parent / f"{output_dir.name}.telemetry-v{version}.jsonl"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not allocate a telemetry filename next to {output_dir}")
 
 
 def train_adapter(
@@ -350,11 +463,42 @@ def train_adapter(
     model_path: str | None = None,
     resume_adapter: Path | None = None,
 ) -> dict[str, Any]:
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"Refusing to overwrite non-empty adapter directory {output_dir}")
+    telemetry_path = _next_telemetry_path(output_dir)
+    print(f"[train] telemetry: {telemetry_path}", flush=True)
+    with TrainingMonitor(
+        telemetry_path,
+        interval_seconds=config.grpo.monitor_interval_seconds,
+        console_seconds=config.grpo.monitor_console_seconds,
+    ) as monitor:
+        return _train_adapter_impl(
+            config=config,
+            rollout_paths=rollout_paths,
+            output_dir=output_dir,
+            model_path=model_path,
+            resume_adapter=resume_adapter,
+            monitor=monitor,
+            telemetry_path=telemetry_path,
+        )
+
+
+def _train_adapter_impl(
+    *,
+    config: ExperimentConfig,
+    rollout_paths: list[Path],
+    output_dir: Path,
+    model_path: str | None,
+    resume_adapter: Path | None,
+    monitor: TrainingMonitor,
+    telemetry_path: Path,
+) -> dict[str, Any]:
     import torch
 
     random.seed(config.grpo.seed)
     torch.manual_seed(config.grpo.seed)
 
+    monitor.set_phase("validate_rollouts")
     source_rows = []
     for path in rollout_paths:
         source_rows.extend(read_jsonl(path))
@@ -373,48 +517,84 @@ def train_adapter(
     if not groups:
         raise ValueError("No trainable groups: every group has identical reward or is unscorable")
 
-    model, tokenizer = _load_model_and_tokenizer(config, model_path, resume_adapter)
-    selective_logits = _supports_selective_logits(model)
-    if not selective_logits and config.grpo.max_seq_length > 8192:
-        raise RuntimeError(
-            "The model forward method lacks selective logits support. Reduce max_seq_length "
-            "to 8192 or use a Transformers revision whose Gemma implementation accepts logits_to_keep."
-        )
-    nonzero_dropouts = [
-        module for module in model.modules() if isinstance(module, torch.nn.Dropout) and module.p > 0
-    ]
-    if nonzero_dropouts:
-        raise RuntimeError(
-            "The loaded policy contains non-zero dropout, so cached old log-probabilities would not be "
-            "deterministic. Train/export an adapter with dropout=0."
-        )
-    model.train()
-    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=config.grpo.learning_rate)
-
     group_items = list(groups.items())
     random.shuffle(group_items)
-    if config.grpo.max_steps is not None:
-        group_items = group_items[: config.grpo.max_steps]
 
+    # Tokenize and reject unusable groups before paying the five-minute model
+    # load/requantization cost.
+    monitor.set_phase("tokenize_rollouts")
+    tokenizer = _load_tokenizer(config, model_path)
     metrics: list[dict[str, Any]] = []
     prepared_groups: list[
         tuple[str, list[tuple[dict[str, Any], list[TokenizedTrajectory]]]]
     ] = []
     for group_id, group_rows in group_items:
         prepared: list[tuple[dict[str, Any], list[TokenizedTrajectory]]] = []
+        oversized: list[dict[str, Any]] = []
         for row in group_rows:
             segments = _row_segments(tokenizer, row)
+            lengths = [len(segment.input_ids) for segment in segments]
+            action_tokens = sum(len(segment.action_positions) for segment in segments)
+            print(
+                f"[train] trajectory group={group_id} seed={row.get('seed')} "
+                f"segments={len(segments)} lengths={lengths} actions={action_tokens}",
+                flush=True,
+            )
             if any(len(segment.input_ids) > config.grpo.max_seq_length for segment in segments):
-                continue
+                oversized.append({"seed": row.get("seed"), "lengths": lengths})
             prepared.append((row, segments))
+        # Advantages were normalized over the complete sampled group. Training
+        # on a subset silently changes their meaning and destroys the zero-mean
+        # group baseline, so reject the entire group if one rollout is too long.
+        if oversized:
+            metrics.append(
+                {
+                    "group_id": group_id,
+                    "skipped": "trajectory_exceeds_max_seq_length",
+                    "max_seq_length": config.grpo.max_seq_length,
+                    "oversized": oversized,
+                }
+            )
+            continue
         if len(prepared) < 2:
             metrics.append({"group_id": group_id, "skipped": "fewer_than_two_usable_rollouts"})
             continue
         prepared_groups.append((group_id, prepared))
+        # max_steps counts usable optimizer groups, not arbitrary groups seen
+        # before tokenization/length validation.
+        if (
+            config.grpo.max_steps is not None
+            and len(prepared_groups) >= config.grpo.max_steps
+        ):
+            break
 
     if not prepared_groups:
         raise ValueError("No group contains at least two trajectories within max_seq_length")
+
+    monitor.set_phase("load_and_dispatch_model")
+    model, tokenizer = _load_model_and_tokenizer(
+        config,
+        model_path,
+        resume_adapter,
+        tokenizer=tokenizer,
+        monitor=monitor,
+    )
+    nonzero_dropouts = [
+        module for module in model.modules() if isinstance(module, torch.nn.Dropout) and module.p > 0
+    ]
+    if nonzero_dropouts:
+        raise RuntimeError(
+            "The loaded policy contains non-zero dropout, so cached old/new policy log-probabilities "
+            "would not be deterministic. Train/export an adapter with dropout=0."
+        )
+    model.train()
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise RuntimeError("The loaded policy has no trainable LoRA parameters")
+    monitor.set_phase("optimizer_init")
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=config.grpo.learning_rate)
+    trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
+    print(f"[train] trainable parameters: {trainable_count:,}", flush=True)
 
     # Snapshot every behavior-policy and reference log-probability before the
     # first optimizer step. Recomputing old_logprobs between groups would make
@@ -437,9 +617,20 @@ def train_adapter(
         for group_id, prepared in prepared_groups:
             cached_rollouts = []
             for row, segments in prepared:
-                old = _rollout_logprobs(model, segments).detach().cpu()
+                seed = row.get("seed")
+                monitor.set_phase(f"cache_old:{group_id}:seed_{seed}")
+                old = _rollout_logprobs(
+                    model,
+                    segments,
+                    chunk_size=config.grpo.logprob_chunk_size,
+                ).detach().cpu()
+                monitor.set_phase(f"cache_reference:{group_id}:seed_{seed}")
                 with _disable_adapter(model):
-                    reference = _rollout_logprobs(model, segments).detach().cpu()
+                    reference = _rollout_logprobs(
+                        model,
+                        segments,
+                        chunk_size=config.grpo.logprob_chunk_size,
+                    ).detach().cpu()
                 cached_rollouts.append((row, segments, old, reference))
             cached_groups.append((group_id, cached_rollouts))
 
@@ -453,7 +644,13 @@ def train_adapter(
             total_loss = 0.0
             total_kl = 0.0
             for row, segments, old_cpu, reference_cpu in cached_rollouts:
-                new = _rollout_logprobs(model, segments)
+                seed = row.get("seed")
+                monitor.set_phase(f"forward_backward:{group_id}:seed_{seed}")
+                new = _rollout_logprobs(
+                    model,
+                    segments,
+                    chunk_size=config.grpo.logprob_chunk_size,
+                )
                 old = old_cpu.to(new.device)
                 reference = reference_cpu.to(new.device)
                 loss, kl = grpo_loss(
@@ -464,12 +661,23 @@ def train_adapter(
                     clip_epsilon=config.grpo.clip_epsilon,
                     beta=config.grpo.beta,
                 )
+                if not bool(torch.isfinite(loss)) or not bool(torch.isfinite(kl)):
+                    raise FloatingPointError(
+                        f"Non-finite GRPO objective for group={group_id} seed={seed}: "
+                        f"loss={float(loss.detach().cpu())}, kl={float(kl.detach().cpu())}"
+                    )
                 (loss / len(cached_rollouts)).backward()
                 total_loss += float(loss.detach().cpu())
                 total_kl += float(kl.detach().cpu())
+            monitor.set_phase(f"optimizer:{group_id}:epoch_{epoch}")
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 trainable_parameters, config.grpo.max_grad_norm
             )
+            if not bool(torch.isfinite(grad_norm)):
+                raise FloatingPointError(
+                    f"Non-finite gradient norm for group={group_id} epoch={epoch}: "
+                    f"{float(grad_norm.detach().cpu())}"
+                )
             optimizer.step()
             optimizer_step += 1
             metrics.append(
@@ -488,14 +696,16 @@ def train_adapter(
 
     if optimizer_step == 0:
         raise ValueError("No optimization step was executed; inspect sequence lengths and trace messages")
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Refusing to overwrite non-empty adapter directory {output_dir}")
+    monitor.set_phase("save_adapter")
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(output_dir, safe_serialization=True)
     summary = {
         "groups_available": len(groups),
         "groups_processed": len(cached_groups),
         "optimizer_steps": optimizer_step,
+        "trainable_parameters": trainable_count,
+        "logprob_chunk_size": config.grpo.logprob_chunk_size,
+        "telemetry_path": str(telemetry_path),
         "token_sources": dict(Counter(str(row.get("token_source", "unknown")) for row in source_rows)),
         "metrics": metrics,
     }

@@ -12,6 +12,10 @@ def test_default_config_has_matching_group_and_seeds():
     assert config.lora.r == 16
     assert config.model.device_map == "balanced"
     assert config.model.max_memory_per_gpu_gib == 22
+    assert config.model.gpu0_reserve_gib == 8
+    assert config.model.other_gpu_reserve_gib == 4
+    assert config.grpo.logprob_chunk_size == 32
+    assert config.grpo.monitor_interval_seconds == 5
 
 
 def test_mismatched_group_size_is_rejected(tmp_path):

@@ -60,3 +60,21 @@ def test_atif_steps_fallback_and_prompt_injection():
     ]
     assert count_tool_calls(trace) == 1
 
+
+def test_partial_atif_token_metrics_fall_back_instead_of_dropping_turns():
+    trace = {
+        "steps": [
+            {
+                "source": "agent",
+                "content": "first",
+                "metrics": {
+                    "prompt_token_ids": [1, 2],
+                    "completion_token_ids": [3],
+                },
+            },
+            {"source": "agent", "content": "second"},
+        ]
+    }
+
+    assert trace_token_segments(trace) == []
+

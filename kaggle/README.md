@@ -252,7 +252,34 @@ if (smoke_dir / "loop_state.json").exists():
 subprocess.run(command, check=True, cwd=PROJECT)
 ```
 
+Каждый `train` внутри loop печатает строки `[monitor]` и сохраняет полный JSONL
+рядом с adapter directory. После smoke найдите последний файл и получите сводку:
+
+```python
+telemetry = max(
+    Path("/kaggle/working/runs").rglob("*.telemetry*.jsonl"),
+    key=lambda path: path.stat().st_mtime,
+)
+subprocess.run(
+    ["gemma-grpo", "telemetry", "--input", str(telemetry)],
+    check=True,
+    cwd=PROJECT,
+)
+print("raw telemetry:", telemetry)
+```
+
+Если train упадёт, telemetry всё равно заканчивается фазой `failed`. Для текущего
+model-parallel режима нормально видеть последовательные пики GPU 0→1→2→3;
+ненормально — CPU/disk offload, VRAM вплотную к 22 GiB или отсутствие активности
+у GPU, которому device map назначил decoder layers.
+
 ## Ячейка 5: непрерывный запуск до 100 optimizer steps
+
+Эта ячейка допустима только если подключённая версия harness сама завершает
+свой model server после каждого `swegemma eval`. Она **не** управляет сервером,
+который вы вручную создали через `adk_submission` и указали в local
+`models.yaml`; оставленный процесс на `127.0.0.1:8000` вызовет OOM при backward.
+Для такого режима сначала нужен managed server lifecycle (см. основной аудит).
 
 ```python
 run_dir = Path("/kaggle/working/runs/grpo-001")

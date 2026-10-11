@@ -196,14 +196,22 @@ def trace_tool_definitions(trace: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def trace_token_segments(trace: Mapping[str, Any]) -> list[dict[str, list[int]]]:
-    """Extract exact per-LLM-call token sequences when the ATIF producer recorded them."""
+    """Extract exact tokens only when every assistant LLM call recorded them.
+
+    Returning a partial list would silently optimize only some turns while the
+    rollout reward belongs to the complete trajectory. Incomplete ATIF metrics
+    therefore fall back to whole-trace chat-template reconstruction.
+    """
+    assistant_steps = [
+        step for step in (_find_steps(trace) or []) if _step_role(step) == "assistant"
+    ]
+    if not assistant_steps:
+        return []
     segments: list[dict[str, list[int]]] = []
-    for step in _find_steps(trace) or []:
-        if _step_role(step) != "assistant":
-            continue
+    for step in assistant_steps:
         metrics = step.get("metrics")
         if not isinstance(metrics, Mapping):
-            continue
+            return []
         prompt = metrics.get("prompt_token_ids")
         completion = metrics.get("completion_token_ids")
         if not (
@@ -213,7 +221,7 @@ def trace_token_segments(trace: Mapping[str, Any]) -> list[dict[str, list[int]]]
             and completion
             and all(isinstance(token, int) for token in prompt + completion)
         ):
-            continue
+            return []
         input_ids = list(prompt) + list(completion)
         segments.append(
             {

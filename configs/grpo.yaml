@@ -11,6 +11,10 @@ model:
   # Spread the model across all four 24 GiB L4s instead of packing GPU 0.
   device_map: balanced
   max_memory_per_gpu_gib: 22
+  # GPU 0 also owns embeddings/lm_head and receives every vocabulary
+  # projection, so leave it more activation headroom than the layer GPUs.
+  gpu0_reserve_gib: 8
+  other_gpu_reserve_gib: 4
 
 lora:
   r: 16
@@ -26,8 +30,11 @@ grpo:
   epochs: 2
   max_steps: null
   max_seq_length: 32768
+  logprob_chunk_size: 32
   max_grad_norm: 1.0
   seed: 42
+  monitor_interval_seconds: 5
+  monitor_console_seconds: 30
 
 rollout:
   # Kaggle notebooks do not expose a Docker daemon. SWEGemma's subprocess

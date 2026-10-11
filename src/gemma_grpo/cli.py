@@ -8,6 +8,7 @@ from .collect import collect_rollouts
 from .config import load_config
 from .export import export_submission
 from .loop import run_training_loop
+from .monitoring import summarize_telemetry
 from .preflight import run_preflight
 from .train import train_adapter
 
@@ -46,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--output-dir", required=True)
     train.add_argument("--model-path")
     train.add_argument("--resume-adapter")
+
+    telemetry = subparsers.add_parser(
+        "telemetry", help="summarize phase-level CPU/RAM/GPU training telemetry"
+    )
+    telemetry.add_argument("--input", required=True)
 
     export = subparsers.add_parser("export", help="package the trained adapter as a Kaggle submission")
     export.add_argument("--submission-dir", default="submission")
@@ -119,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
             output_zip=Path(args.output).resolve(),
         )
         print(created)
+        return 0
+    if args.command == "telemetry":
+        summary = summarize_telemetry(Path(args.input).resolve())
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
     if args.command == "loop":
         state = run_training_loop(

@@ -186,22 +186,31 @@ def collect_rollouts(
                 tool_calls = count_tool_calls(trace)
             outcome = score_result(result, patch=patch, tool_calls=tool_calls, config=config.reward)
             token_segments = trace_token_segments(trace)
+            has_trainable_trace = bool(token_segments) or any(
+                message.get("role") == "assistant" for message in messages
+            )
+            reward = outcome.reward if has_trainable_trace else None
+            scorable = outcome.scorable and has_trainable_trace
+            reward_reason = (
+                outcome.reason if has_trainable_trace else "missing_trainable_trace"
+            )
             row: dict[str, Any] = {
                 "task_id": current_task_id,
                 "group_id": group_id,
                 "iteration": iteration,
                 "seed": seed,
                 "policy_id": policy_id,
-                "reward": outcome.reward,
+                "reward": reward,
                 "resolved": outcome.resolved,
-                "scorable": outcome.scorable,
-                "reward_reason": outcome.reason,
+                "scorable": scorable,
+                "reward_reason": reward_reason,
                 "tool_calls": tool_calls,
                 "patch": patch,
                 "messages": messages,
                 "tools": trace_tool_definitions(trace),
                 "token_segments": token_segments,
                 "token_source": "atif_token_ids" if token_segments else "chat_template_reconstruction",
+                "trace_trainable": has_trainable_trace,
                 "swegemma_returncode": completed.returncode,
                 "swegemma_output_tail": completed.stdout[-4000:],
                 "result": result,

@@ -37,6 +37,7 @@ PPO старых token log-probabilities. Здесь они честно пер�
 - `configs/grpo.yaml` — LoRA r=16/alpha=32, group size 4, beta 0.01 и лимиты.
 - `gemma-grpo collect` — канонические rollout'ы через `swegemma`.
 - `gemma-grpo train` — artifact-based GRPO update.
+- `gemma-grpo telemetry` — сводка CPU/RAM/GPU по фазам прошедшего train.
 - `gemma-grpo export` — ZIP с агентом и адаптером для Kaggle.
 - `gemma-grpo preflight` — проверки wheelhouse, данных, rank и chat template.
 - `gemma-grpo loop` — непрерывно чередует свежие rollout'ы и GRPO до заданного
@@ -128,9 +129,10 @@ Docker daemon. Ошибка evaluation worker/sandbox записывается �
 
 ### Непрерывный режим без ручного collect/train
 
-Для обычного запуска отдельные команды ниже не нужны. Один launcher сам
-переключает GPU между harness/vLLM и backward, обновляет adapter, меняет seeds и
-собирает свежие rollout'ы до указанного числа optimizer steps:
+Если используемая версия competition harness сама поднимает vLLM только на время
+`swegemma eval` и гарантированно освобождает его после команды, отдельные команды
+ниже не нужны. Launcher обновляет adapter, меняет seeds и собирает свежие
+rollout'ы до указанного числа optimizer steps:
 
 ```bash
 gemma-grpo loop \
@@ -156,6 +158,11 @@ gemma-grpo loop \
 reward и нулевой advantage, launcher не делает фиктивный optimizer step, а
 автоматически собирает следующую группу с другим набором seed.
 
+Важно: если `--models-yaml` указывает на вручную поднятый внешний vLLM
+(`127.0.0.1:8000`), launcher не владеет его процессом и не может освободить VRAM
+перед backward. Такой server надо пока останавливать отдельно; полностью managed
+lifecycle отмечен как открытый пункт аудита.
+
 ## 4. GRPO update
 
 Дождитесь завершения `collect`, чтобы запущенный harness model server освободил
@@ -170,11 +177,22 @@ gemma-grpo train \
   --output-dir outputs/adapter_iter_0001
 ```
 
-Trainer обновляет только LoRA-параметры. Для длинных последовательностей он
-требует модельный `forward(..., logits_to_keep=...)`, чтобы не материализовать
-огромный tensor логитов для всей 32k-трассы. Если установленная версия
-Transformers этого не умеет, запуск останавливается до OOM; для smoke test можно
-уменьшить `max_seq_length` до 4096–8192.
+Trainer обновляет только LoRA-параметры. Backbone выполняется один раз на всю
+последовательность, после чего выбираются hidden states перед assistant-токенами,
+а `lm_head + log_softmax` считаются кусками по `grpo.logprob_chunk_size`. При
+6 574 action-токенах и vocab 262 144 старый полный FP32 tensor занимал 6.42 GiB;
+chunk size 32 уменьшает этот временный tensor примерно до 32 MiB. Для backward
+куски пересчитываются activation checkpointing'ом и не остаются все в VRAM.
+
+Каждый `train` автоматически пишет рядом с output directory телеметрию, например
+`adapter_iter_0001.telemetry.jsonl`. Она содержит текущую фазу, utilization/VRAM/
+power/temperature всех GPU, PyTorch allocated/reserved, CPU, RSS и RAM. Сводка:
+
+```bash
+gemma-grpo telemetry --input outputs/adapter_iter_0001.telemetry.jsonl
+```
+
+Файл не перезаписывается при повторном запуске: создаются суффиксы `-v2`, `-v3`.
 
 В Kaggle-конфигах используется `model.load_mode: bnb4`. Обычный BF16 checkpoint
 при этом загружается стандартным QLoRA-путём. Competition checkpoint в формате
@@ -183,6 +201,13 @@ Linear по отдельности переквантовывается в bitsa
 возвращается на CPU до финального распределения по четырём L4. Поэтому на GPU
 base остаётся 4-битной, но это не bit-exact исходный QAT W4: между rollout и
 trainer base появляется небольшая ошибка повторного квантования.
+
+GPU 0 получает меньший weight budget (`gpu0_reserve_gib: 8`), потому что на нём
+также лежат embeddings/lm_head и выполняется vocabulary projection. Остальные
+GPU резервируют по 4 GiB. Это распределение слоёв — последовательный model
+parallel: один microbatch идёт через устройства по очереди. Поэтому одновременные
+100% на четырёх GPU здесь не ожидаются; для настоящего параллельного backward
+нужна отдельная FSDP/DeepSpeed/tensor-parallel архитектура.
 
 Группы с одинаковым reward имеют нулевой advantage и пропускаются. Для реального
 сигнала стоит выбирать задачи, где текущая policy иногда решает задачу, а иногда
@@ -243,8 +268,14 @@ notebook.
 - `device_map="auto"` + LoRA подходит для первичного QLoRA-style эксперимента,
   но для устойчивого многодневного обучения лучше FSDP/DeepSpeed и отдельный
   rollout cluster.
+- Если rollout имеет `token_source=chat_template_reconstruction`, его токены
+  восстановлены, а не взяты из vLLM bit-for-bit. Для длинного запуска предпочитайте
+  ATIF traces с полными `prompt_token_ids`/`completion_token_ids` всех LLM calls.
 - Для честной оценки держите закрытый validation split и не выбирайте checkpoint
   по public leaderboard.
+
+Полный аудит пути обучения, исправленные дефекты и критерии допуска к длинному
+run описаны в [`docs/training-audit.md`](docs/training-audit.md).
 
 Полезные первичные материалы: [официальный Getting Started notebook](https://www.kaggle.com/code/ryanholbrook/getting-started-gemma-4-developer-agent/input),
 [competition page](https://www.kaggle.com/competitions/gemma-4-developer-agent/overview),

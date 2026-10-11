@@ -35,8 +35,11 @@ class GrpoConfig:
     epochs: int = 2
     max_steps: int | None = None
     max_seq_length: int = 32768
+    logprob_chunk_size: int = 64
     max_grad_norm: float = 1.0
     seed: int = 42
+    monitor_interval_seconds: float = 5.0
+    monitor_console_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,8 @@ class ModelConfig:
     load_mode: str = "native"
     device_map: str = "balanced"
     max_memory_per_gpu_gib: int | None = None
+    gpu0_reserve_gib: int = 8
+    other_gpu_reserve_gib: int = 4
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,14 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raise ValueError("rollout.sandbox must be 'docker' or 'subprocess'")
     if config.grpo.epochs < 1:
         raise ValueError("grpo.epochs must be at least 1")
+    if config.grpo.max_steps is not None and config.grpo.max_steps < 1:
+        raise ValueError("grpo.max_steps must be positive when set")
+    if config.grpo.logprob_chunk_size < 1:
+        raise ValueError("grpo.logprob_chunk_size must be positive")
+    if config.grpo.monitor_interval_seconds <= 0:
+        raise ValueError("grpo.monitor_interval_seconds must be positive")
+    if config.grpo.monitor_console_seconds <= 0:
+        raise ValueError("grpo.monitor_console_seconds must be positive")
     if not 0 < config.lora.r <= 128:
         raise ValueError("lora.r must be between 1 and the competition maximum of 128")
     if config.lora.dropout != 0.0:
@@ -117,5 +130,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
         and config.model.max_memory_per_gpu_gib < 1
     ):
         raise ValueError("model.max_memory_per_gpu_gib must be positive")
+    if config.model.gpu0_reserve_gib < 1:
+        raise ValueError("model.gpu0_reserve_gib must be positive")
+    if config.model.other_gpu_reserve_gib < 1:
+        raise ValueError("model.other_gpu_reserve_gib must be positive")
     return config
 
