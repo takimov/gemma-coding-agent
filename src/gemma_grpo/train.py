@@ -264,6 +264,27 @@ def _embedding_device(model: Any):
     return model.get_input_embeddings().weight.device
 
 
+def _logit_selection_device(model: Any):
+    """Return the device holding hidden states immediately before ``lm_head``.
+
+    Gemma applies tensor-valued ``logits_to_keep`` to the final hidden states
+    before calling ``lm_head``.  Under Accelerate model parallelism those hidden
+    states live with the language-model norm, not necessarily with embeddings
+    or the (tied) output head.
+    """
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    for owner in (model, base_model):
+        device_map = getattr(owner, "hf_device_map", None)
+        if device_map:
+            for name, device in device_map.items():
+                if name.endswith("language_model.norm"):
+                    return f"cuda:{device}" if isinstance(device, int) else device
+    for name, parameter in model.named_parameters():
+        if name.endswith("language_model.norm.weight"):
+            return parameter.device
+    return _embedding_device(model)
+
+
 def _supports_selective_logits(model: Any) -> bool:
     signature = inspect.signature(model.get_base_model().forward)
     return "logits_to_keep" in signature.parameters
@@ -272,18 +293,26 @@ def _supports_selective_logits(model: Any) -> bool:
 def _selected_logprobs(model: Any, tokenized: TokenizedTrajectory):
     import torch
 
-    device = _embedding_device(model)
-    input_ids = torch.tensor([tokenized.input_ids], dtype=torch.long, device=device)
-    target_positions = torch.tensor(tokenized.action_positions, dtype=torch.long, device=device)
-    logit_positions = target_positions - 1
+    input_device = _embedding_device(model)
+    input_ids = torch.tensor([tokenized.input_ids], dtype=torch.long, device=input_device)
+    target_positions = torch.tensor(
+        tokenized.action_positions, dtype=torch.long, device=input_device
+    )
     kwargs: dict[str, Any] = {"input_ids": input_ids, "use_cache": False}
     base_signature = inspect.signature(model.get_base_model().forward)
     if "logits_to_keep" in base_signature.parameters:
+        logit_positions = torch.tensor(
+            [position - 1 for position in tokenized.action_positions],
+            dtype=torch.long,
+            device=_logit_selection_device(model),
+        )
         kwargs["logits_to_keep"] = logit_positions
     elif "num_logits_to_keep" in base_signature.parameters:
         # Older model implementations only support a suffix. It is correct only
         # when all selected targets lie in that suffix, so fall back to full logits.
-        pass
+        logit_positions = target_positions - 1
+    else:
+        logit_positions = target_positions - 1
     outputs = model(**kwargs)
     logits = outputs.logits
     logit_positions = logit_positions.to(logits.device)
