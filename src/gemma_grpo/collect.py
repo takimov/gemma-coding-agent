@@ -49,6 +49,7 @@ def _prepare_submission(
     adapter: Path | None,
     max_tool_calls: int,
     max_time_minutes: int,
+    model_alias: str = "gemma-4-31b-it-qat-w4a16-ct",
 ) -> None:
     shutil.copytree(source, destination)
     sampling_path = destination / "configs" / "sampling.yaml"
@@ -63,12 +64,22 @@ def _prepare_submission(
     evaluation["max_time_minutes"] = max_time_minutes
     eval_path.write_text(yaml.safe_dump(eval_config, sort_keys=False), encoding="utf-8")
 
+    agent_path = destination / "agent.yaml"
+    lines = agent_path.read_text(encoding="utf-8").splitlines()
+    model_replaced = False
+    for index, line in enumerate(lines):
+        if line.startswith("model:"):
+            lines[index] = f"model: {model_alias}"
+            model_replaced = True
+            break
+    if not model_replaced:
+        lines.insert(1, f"model: {model_alias}")
+
     if adapter is None:
+        agent_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return
     adapter_target = destination / "adapters" / "main_lora"
     _copy_adapter(adapter, adapter_target)
-    agent_path = destination / "agent.yaml"
-    lines = agent_path.read_text(encoding="utf-8").splitlines()
     replaced = False
     for index, line in enumerate(lines):
         if line.startswith("adapter:"):
@@ -137,6 +148,16 @@ def collect_rollouts(
         raise FileExistsError(
             f"Refusing to overwrite {output_path}; use a new iteration or remove it explicitly"
         )
+    capture_native_behavior = (
+        config.rollout.managed_vllm
+        and config.rollout.vllm_checkpoint_format == "compressed-tensors"
+        and capture_behavior_logprobs
+    )
+    if capture_native_behavior and behavior_model_path is None:
+        raise ValueError(
+            "Native W4 rollout requires behavior_model_path to capture exact "
+            "behavior-policy log-probabilities"
+        )
 
     for task in tasks:
         current_task_id = task_id(task)
@@ -162,6 +183,7 @@ def collect_rollouts(
                     adapter=adapter,
                     max_tool_calls=config.rollout.max_tool_calls,
                     max_time_minutes=config.rollout.max_time_minutes,
+                    model_alias=config.rollout.vllm_served_model_name,
                 )
                 completed = run_eval(
                     SwegemmaInvocation(
@@ -198,7 +220,11 @@ def collect_rollouts(
             if not messages:
                 tool_calls = count_tool_calls(trace)
             outcome = score_result(result, patch=patch, tool_calls=tool_calls, config=config.reward)
-            token_segments = trace_token_segments(trace)
+            token_segments = (
+                trace_token_segments(trace)
+                if config.rollout.preserve_trace_token_ids
+                else []
+            )
             has_trainable_trace = bool(token_segments) or any(
                 message.get("role") == "assistant" for message in messages
             )
@@ -256,28 +282,26 @@ def collect_rollouts(
                 thread_name_prefix="gemma-rollout",
             ) as executor:
                 task_rows = list(executor.map(collect_seed, config.rollout.seeds))
-        rows.extend(task_rows)
-
-    normalized = add_group_advantages(rows)
-    if (
-        config.rollout.managed_vllm
-        and config.rollout.vllm_checkpoint_format == "compressed-tensors"
-        and capture_behavior_logprobs
-    ):
-        if behavior_model_path is None:
-            raise ValueError(
-                "Native W4 rollout requires behavior_model_path to capture exact "
-                "behavior-policy log-probabilities"
+        normalized_task = add_group_advantages(task_rows)
+        if capture_native_behavior:
+            assert behavior_model_path is not None
+            normalized_task = attach_behavior_logprobs(
+                normalized_task,
+                tokenizer_path=behavior_model_path,
+                api_base=f"http://127.0.0.1:{config.rollout.vllm_port}/v1",
+                model=(
+                    "main_lora"
+                    if adapter is not None
+                    else config.rollout.vllm_served_model_name
+                ),
+                trust_remote_code=config.model.trust_remote_code,
+                max_workers=config.rollout.concurrency,
             )
-        normalized = attach_behavior_logprobs(
-            normalized,
-            tokenizer_path=behavior_model_path,
-            api_base=f"http://127.0.0.1:{config.rollout.vllm_port}/v1",
-            model="main_lora" if adapter is not None else "gemma-4-31b-it-qat-w4a16-ct",
-            trust_remote_code=config.model.trust_remote_code,
-            max_workers=config.rollout.concurrency,
-        )
-    for row in normalized:
-        append_jsonl(output_path, row)
-    return normalized
+        # Checkpoint every completed task group.  Long teacher/SFT collection
+        # must retain earlier verified trajectories if a later sandbox fails.
+        for row in normalized_task:
+            append_jsonl(output_path, row)
+        rows.extend(normalized_task)
+
+    return rows
 

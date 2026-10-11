@@ -62,13 +62,19 @@ def vllm_environment(*, enable_nf4_compat: bool = True) -> dict[str, str]:
     return environment
 
 
-def write_models_yaml(path: Path, *, port: int, adapter: Path | None) -> Path:
+def write_models_yaml(
+    path: Path,
+    *,
+    port: int,
+    adapter: Path | None,
+    served_model_name: str = BASE_MODEL_ALIAS,
+) -> Path:
     api_base = f"http://127.0.0.1:{port}/v1"
     models: dict[str, dict[str, str]] = {
-        BASE_MODEL_ALIAS: {
+        served_model_name: {
             "api_base": api_base,
             "api_key": "EMPTY",
-            "path": f"openai/{BASE_MODEL_ALIAS}",
+            "path": f"openai/{served_model_name}",
         }
     }
     if adapter is not None:
@@ -111,6 +117,10 @@ class ManagedVllmServer:
     def uses_nf4(self) -> bool:
         return self.checkpoint_format == "nf4"
 
+    @property
+    def served_model_name(self) -> str:
+        return self.config.rollout.vllm_served_model_name
+
     def _environment(self) -> dict[str, str]:
         return vllm_environment(enable_nf4_compat=self.uses_nf4)
 
@@ -139,7 +149,7 @@ class ManagedVllmServer:
             "--model",
             str(self.model_path),
             "--served-model-name",
-            BASE_MODEL_ALIAS,
+            self.served_model_name,
             "--port",
             str(rollout.vllm_port),
             "--tensor-parallel-size",
@@ -161,9 +171,23 @@ class ManagedVllmServer:
         if self.uses_nf4:
             add("--quantization", "bitsandbytes")
             add("--load-format", "bitsandbytes")
-        add("--tool-call-parser", "gemma4")
-        add("--reasoning-parser", "gemma4")
-        add("--reasoning-config", json.dumps(GEMMA4_REASONING_CONFIG))
+        if rollout.vllm_tool_call_parser:
+            add("--tool-call-parser", rollout.vllm_tool_call_parser)
+        if rollout.vllm_reasoning_parser:
+            add("--reasoning-parser", rollout.vllm_reasoning_parser)
+        if (
+            rollout.vllm_reasoning_start_str is not None
+            and rollout.vllm_reasoning_end_str is not None
+        ):
+            add(
+                "--reasoning-config",
+                json.dumps(
+                    {
+                        "reasoning_start_str": rollout.vllm_reasoning_start_str,
+                        "reasoning_end_str": rollout.vllm_reasoning_end_str,
+                    }
+                ),
+            )
         add("--logprobs-mode", "raw_logprobs")
         add("--enable-auto-tool-choice")
         add("--disable-log-requests")
@@ -173,7 +197,10 @@ class ManagedVllmServer:
             add("--language-model-only")
         if "--default-chat-template-kwargs" in flags:
             command.extend(
-                ["--default-chat-template-kwargs", json.dumps({"enable_thinking": True})]
+                [
+                    "--default-chat-template-kwargs",
+                    json.dumps({"enable_thinking": rollout.vllm_enable_thinking}),
+                ]
             )
         if self.adapter is not None:
             required = (
@@ -209,7 +236,7 @@ class ManagedVllmServer:
             ) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             ids = {str(item.get("id")) for item in payload.get("data", [])}
-            required = ADAPTER_ALIAS if self.adapter is not None else BASE_MODEL_ALIAS
+            required = ADAPTER_ALIAS if self.adapter is not None else self.served_model_name
             return required in ids
         except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
             return False
@@ -234,6 +261,7 @@ class ManagedVllmServer:
             self.models_yaml,
             port=self.config.rollout.vllm_port,
             adapter=self.adapter,
+            served_model_name=self.served_model_name,
         )
         self._log_handle = self.log_path.open("w", encoding="utf-8")
         environment = self._environment()

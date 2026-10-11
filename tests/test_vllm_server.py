@@ -38,6 +38,20 @@ def test_models_yaml_routes_base_and_adapter_to_managed_server(tmp_path):
     assert models[ADAPTER_ALIAS]["path"] == f"openai/{ADAPTER_ALIAS}"
 
 
+def test_models_yaml_routes_configurable_teacher_alias(tmp_path):
+    alias = "qwen3-coder-next-teacher"
+    path = write_models_yaml(
+        tmp_path / "models.yaml",
+        port=8123,
+        adapter=None,
+        served_model_name=alias,
+    )
+    models = yaml.safe_load(path.read_text(encoding="utf-8"))["models"]
+
+    assert set(models) == {alias}
+    assert models[alias]["path"] == f"openai/{alias}"
+
+
 def test_managed_vllm_uses_tensor_parallel_for_native_w4(tmp_path, monkeypatch):
     config = load_config("configs/smoke.yaml")
     server = ManagedVllmServer(
@@ -96,6 +110,39 @@ def test_native_vllm_environment_removes_nf4_compat(monkeypatch):
 
     assert "GEMMA_GRPO_VLLM_BNB_COMPAT" not in environment
     assert environment["PYTHONPATH"] == "/existing"
+
+
+def test_qwen_teacher_uses_its_alias_parser_and_no_reasoning_parser(
+    tmp_path, monkeypatch
+):
+    config = load_config("configs/teacher-qwen.yaml")
+    server = ManagedVllmServer(
+        config=config,
+        model_path=tmp_path / "model",
+        adapter=None,
+        work_dir=tmp_path / "run",
+    )
+    monkeypatch.setattr(
+        server,
+        "_supported_flags",
+        lambda: (
+            "--tool-call-parser --reasoning-parser --reasoning-config "
+            "--default-chat-template-kwargs --logprobs-mode "
+            "--enable-auto-tool-choice --disable-log-requests"
+        ),
+    )
+
+    command = server._command()
+
+    assert command[command.index("--served-model-name") + 1] == (
+        "qwen3-coder-next-teacher"
+    )
+    assert command[command.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert "--reasoning-parser" not in command
+    assert "--reasoning-config" not in command
+    assert json.loads(command[command.index("--default-chat-template-kwargs") + 1]) == {
+        "enable_thinking": False
+    }
 
 
 def test_nf4_backend_keeps_bitsandbytes_pipeline_flags(tmp_path, monkeypatch):

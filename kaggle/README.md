@@ -28,6 +28,11 @@ SHA256 Linux-wheel `bitsandbytes==0.48.1`. vLLM 0.19.1 использует со
 4. `timurakimoff/gemma-grpo-source`;
 5. со второй сессии — сохранённый NF4 checkpoint предыдущей версии notebook.
 
+Для отдельного teacher-run дополнительно подключите Hugging Face model
+`inference-optimization/Qwen3-Coder-Next.w4a16` как Kaggle Input. Это готовый
+43.9 GB `compressed-tensors` W4A16 checkpoint; не копируйте его в
+`/kaggle/working`.
+
 Accelerator: `GPU L4 ×4`. Internet: Off.
 
 ## Ячейка 1 — код и офлайн-зависимости
@@ -283,6 +288,78 @@ for task_id in SFT_TASK_IDS:
     command.extend(["--task-id", task_id])
 subprocess.run(command, check=True, cwd=PROJECT)
 ```
+
+### Сбор verified trajectories через Qwen3-Coder-Next
+
+Qwen используется только как offline teacher. Competition submission и
+обучаемый student остаются Gemma 4. Сначала найдите смонтированный W4 checkpoint:
+
+```python
+def is_qwen3_coder_next_w4(path):
+    try:
+        config = json.loads((path / "config.json").read_text())
+        quant = config.get("quantization_config") or {}
+        return (
+            config.get("model_type") == "qwen3_next"
+            and config.get("architectures") == ["Qwen3NextForCausalLM"]
+            and str(quant.get("quant_method", "")).lower() == "compressed-tensors"
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+qwen_teacher = next(
+    path.parent
+    for path in INPUT.rglob("config.json")
+    if is_qwen3_coder_next_w4(path.parent)
+)
+print("Qwen teacher:", qwen_teacher)
+```
+
+Перед длинным сбором выполните один smoke на новой задаче и в новом каталоге:
+
+```python
+QWEN_SMOKE_TASK = "REPLACE_WITH_REAL_TASK_ID"
+QWEN_RUN = Path("/kaggle/working/runs/qwen-teacher-smoke-v1")
+assert not QWEN_RUN.exists(), QWEN_RUN
+
+subprocess.run(
+    [
+        "gemma-grpo", "preflight",
+        "--config", str(PROJECT / "configs/teacher-qwen.yaml"),
+        "--tasks", str(data_root / "tasks.jsonl"),
+        "--snapshots-dir", str(data_root / "snapshots"),
+        "--submission-dir", str(PROJECT / "submission-qwen"),
+        "--model-path", str(NF4_DIR),
+        "--rollout-model-path", str(qwen_teacher),
+    ],
+    check=True,
+    cwd=PROJECT,
+)
+
+subprocess.run(
+    [
+        "gemma-grpo", "collect",
+        "--config", str(PROJECT / "configs/teacher-qwen.yaml"),
+        "--tasks", str(data_root / "tasks.jsonl"),
+        "--snapshots-dir", str(data_root / "snapshots"),
+        "--submission-dir", str(PROJECT / "submission-qwen"),
+        "--model-path", str(qwen_teacher),
+        "--results-root", str(QWEN_RUN / "results"),
+        "--output", str(QWEN_RUN / "rollouts.jsonl"),
+        "--iteration", "0",
+        "--skip-behavior-logprobs",
+        "--task-id", QWEN_SMOKE_TASK,
+    ],
+    check=True,
+    cwd=PROJECT,
+)
+```
+
+`teacher-qwen.yaml` использует TP=4, `qwen3_coder`, 32k context и четыре
+одновременных seed. Qwen3-Coder-Next не имеет thinking mode, поэтому Gemma
+reasoning parser отключён. Сырые Qwen token IDs также отключены: при дальнейшем
+SFT teacher messages заново токенизируются Gemma tokenizer. Оставляйте только
+`resolved=true`; failed teacher traces не становятся SFT targets.
 
 Обучение по всем накопленным JSONL (global batch равен четырём GPU):
 

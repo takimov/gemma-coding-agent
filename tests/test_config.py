@@ -44,6 +44,20 @@ def test_sft_config_uses_safe_offline_defaults():
     assert smoke.lora.alpha == config.lora.alpha
 
 
+def test_qwen_teacher_config_discards_cross_tokenizer_ids():
+    config = load_config(Path(__file__).parents[1] / "configs" / "teacher-qwen.yaml")
+
+    assert config.rollout.vllm_served_model_name == "qwen3-coder-next-teacher"
+    assert config.rollout.vllm_tool_call_parser == "qwen3_coder"
+    assert config.rollout.vllm_reasoning_parser is None
+    assert config.rollout.vllm_reasoning_start_str is None
+    assert config.rollout.vllm_reasoning_end_str is None
+    assert config.rollout.vllm_enable_thinking is False
+    assert config.rollout.preserve_trace_token_ids is False
+    assert config.rollout.vllm_tensor_parallel_size == 4
+    assert config.rollout.vllm_max_model_len == 32768
+
+
 def test_mismatched_group_size_is_rejected(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text(

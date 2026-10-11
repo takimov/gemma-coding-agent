@@ -29,6 +29,17 @@ class RolloutConfig:
     # ``compressed-tensors`` path serves the official QAT W4A16 checkpoint
     # while FSDP continues to train the persistent NF4 copy.
     vllm_checkpoint_format: str = "nf4"
+    # Name exposed through both vLLM and models.yaml.  Keeping this configurable
+    # allows an offline teacher to drive the same SWEGemma agent scaffold.
+    vllm_served_model_name: str = "gemma-4-31b-it-qat-w4a16-ct"
+    vllm_tool_call_parser: str | None = "gemma4"
+    vllm_reasoning_parser: str | None = "gemma4"
+    vllm_reasoning_start_str: str | None = "<|channel>"
+    vllm_reasoning_end_str: str | None = "<channel|>"
+    vllm_enable_thinking: bool = True
+    # ATIF token ids belong to the rollout tokenizer.  Cross-tokenizer teacher
+    # traces (for example Qwen -> Gemma SFT) must be reconstructed from messages.
+    preserve_trace_token_ids: bool = True
     vllm_port: int = 8000
     vllm_tensor_parallel_size: int = 1
     vllm_pipeline_parallel_size: int = 4
@@ -211,6 +222,17 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if config.rollout.vllm_checkpoint_format not in {"nf4", "compressed-tensors"}:
         raise ValueError(
             "rollout.vllm_checkpoint_format must be 'nf4' or 'compressed-tensors'"
+        )
+    if not config.rollout.vllm_served_model_name.strip():
+        raise ValueError("rollout.vllm_served_model_name must be non-empty")
+    reasoning_bounds = (
+        config.rollout.vllm_reasoning_start_str,
+        config.rollout.vllm_reasoning_end_str,
+    )
+    if (reasoning_bounds[0] is None) != (reasoning_bounds[1] is None):
+        raise ValueError(
+            "rollout.vllm_reasoning_start_str and vllm_reasoning_end_str "
+            "must either both be set or both be null"
         )
     if config.rollout.vllm_tensor_parallel_size < 1:
         raise ValueError("rollout.vllm_tensor_parallel_size must be positive")

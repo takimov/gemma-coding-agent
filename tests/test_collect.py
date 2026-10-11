@@ -3,6 +3,7 @@ import subprocess
 import threading
 from dataclasses import replace
 
+import pytest
 import yaml
 
 from gemma_grpo.collect import _prepare_submission, collect_rollouts
@@ -41,6 +42,31 @@ def test_prepared_submission_updates_seed_budget_and_adapter(tmp_path):
     assert "adapter: main_lora" in (destination / "agent.yaml").read_text()
     adapter_files = {path.name for path in (destination / "adapters" / "main_lora").iterdir()}
     assert adapter_files == {"adapter_config.json", "adapter_model.safetensors"}
+
+
+def test_prepared_submission_retargets_offline_teacher_model(tmp_path):
+    source = tmp_path / "source"
+    (source / "configs").mkdir(parents=True)
+    (source / "configs" / "sampling.yaml").write_text("seed: 1\n", encoding="utf-8")
+    (source / "eval_config.yaml").write_text("evaluation: {}\n", encoding="utf-8")
+    (source / "agent.yaml").write_text(
+        "name: teacher\nmodel: gemma\ntools: []\n", encoding="utf-8"
+    )
+
+    destination = tmp_path / "prepared"
+    _prepare_submission(
+        source,
+        destination,
+        seed=101,
+        adapter=None,
+        max_tool_calls=20,
+        max_time_minutes=15,
+        model_alias="qwen3-coder-next-teacher",
+    )
+
+    assert "model: qwen3-coder-next-teacher" in (
+        destination / "agent.yaml"
+    ).read_text(encoding="utf-8")
 
 
 def test_collect_rollouts_runs_group_seeds_concurrently_and_preserves_order(
@@ -88,4 +114,58 @@ def test_collect_rollouts_runs_group_seeds_concurrently_and_preserves_order(
 
     assert [row["seed"] for row in rows] == list(config.rollout.seeds)
     assert all(row["swegemma_returncode"] == 0 for row in rows)
+
+
+def test_collect_rollouts_checkpoints_completed_task_before_later_failure(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "submission"
+    (source / "configs").mkdir(parents=True)
+    (source / "configs" / "sampling.yaml").write_text("seed: 1\n", encoding="utf-8")
+    (source / "eval_config.yaml").write_text("evaluation: {}\n", encoding="utf-8")
+    (source / "agent.yaml").write_text("name: a\nmodel: base\n", encoding="utf-8")
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text(
+        "\n".join(
+            json.dumps({"instance_id": name, "problem_statement": "fix it"})
+            for name in ("task_1", "task_2")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+
+    def fake_run_eval(invocation, *, check=False):
+        if invocation.task_id == "task_2":
+            raise RuntimeError("later sandbox failed")
+        invocation.results_dir.mkdir(parents=True, exist_ok=True)
+        (invocation.results_dir / "task_results.jsonl").write_text(
+            json.dumps({"instance_id": invocation.task_id, "resolved": False}) + "\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess([], 0, stdout="ok")
+
+    monkeypatch.setattr("gemma_grpo.collect.run_eval", fake_run_eval)
+    config = load_config("configs/smoke.yaml")
+    config = replace(
+        config,
+        rollout=replace(config.rollout, managed_vllm=False, concurrency=1),
+    )
+    output = tmp_path / "rollouts.jsonl"
+
+    with pytest.raises(RuntimeError, match="later sandbox failed"):
+        collect_rollouts(
+            config=config,
+            tasks_path=tasks,
+            snapshots_dir=snapshots,
+            submission_dir=source,
+            results_root=tmp_path / "results",
+            output_path=output,
+            iteration=0,
+        )
+
+    saved = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(saved) == 4
+    assert {row["task_id"] for row in saved} == {"task_1"}
 

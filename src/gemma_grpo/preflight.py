@@ -223,7 +223,7 @@ def run_preflight(
                     check_name = "shared rollout NF4 checkpoint"
                 else:
                     assert_compressed_w4_checkpoint(rollout_path)
-                    check_name = "rollout QAT W4A16 checkpoint"
+                    check_name = "rollout compressed-tensors W4 checkpoint"
                 record(
                     check_name,
                     True,
@@ -233,7 +233,7 @@ def run_preflight(
                 check_name = (
                     "shared rollout NF4 checkpoint"
                     if config.rollout.vllm_checkpoint_format == "nf4"
-                    else "rollout QAT W4A16 checkpoint"
+                    else "rollout compressed-tensors W4 checkpoint"
                 )
                 record(check_name, False, str(error))
 
@@ -299,14 +299,19 @@ def run_preflight(
             "--max-model-len",
             "--max-num-seqs",
             "--served-model-name",
-            "--reasoning-parser",
-            "--reasoning-config",
             "--logprobs-mode",
+            "--enable-auto-tool-choice",
             "--enable-lora",
             "--lora-modules",
             "--max-lora-rank",
             "--max-loras",
         ]
+        if config.rollout.vllm_tool_call_parser:
+            required_flags.append("--tool-call-parser")
+        if config.rollout.vllm_reasoning_parser:
+            required_flags.append("--reasoning-parser")
+        if config.rollout.vllm_reasoning_start_str is not None:
+            required_flags.append("--reasoning-config")
         if uses_nf4:
             required_flags.extend(["--quantization", "--load-format"])
         if config.rollout.vllm_language_model_only:

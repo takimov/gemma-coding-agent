@@ -126,6 +126,35 @@ User/system/tool-output токены остаются контекстом, но
 отбрасывается: свободные FSDP ranks выполняют синхронизированный zero-loss
 forward.
 
+## Qwen3-Coder-Next W4 teacher
+
+Для rejection-sampling SFT можно собирать траектории более сильным offline
+teacher: `Qwen3-Coder-Next` (80B total, 3B active) в заранее подготовленном
+`compressed-tensors` W4A16 checkpoint. Используйте
+`configs/teacher-qwen.yaml` и `submission-qwen`; финальный submission всё равно
+остаётся Gemma 4.
+
+```bash
+gemma-grpo collect \
+  --config configs/teacher-qwen.yaml \
+  --tasks /path/to/tasks.jsonl \
+  --snapshots-dir /path/to/snapshots \
+  --submission-dir submission-qwen \
+  --model-path /path/to/Qwen3-Coder-Next.w4a16 \
+  --results-root runs/qwen-teacher/results \
+  --output runs/qwen-teacher/rollouts.jsonl \
+  --iteration 0 \
+  --skip-behavior-logprobs \
+  --task-id TASK_A
+```
+
+Teacher запускается с TP=4, контекстом 32k и parser `qwen3_coder`. Его ATIF
+token IDs намеренно не сохраняются: vocab Qwen и Gemma различается, поэтому
+SFT восстанавливает сообщения и токенизирует teacher actions Gemma-токенизатором.
+В обучение по-прежнему автоматически допускаются только `resolved=true`
+траектории. Это verified teacher SFT; полноценный token-level OPD между двумя
+разными vocabulary без отдельного выравнивания logits не заявляется.
+
 ## Что считается в GRPO
 
 Для каждой задачи собираются четыре траектории. Reward официального SWEGemma
