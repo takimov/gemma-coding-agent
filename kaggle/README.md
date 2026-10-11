@@ -56,6 +56,17 @@ print("commit:", commit)
 Для notebook version, которая обязана работать с выключенным Internet,
 используйте ZIP/Kaggle Dataset из следующего раздела.
 
+После каждого проверенного commit приватный source dataset можно обновить с
+локального Mac официальным Kaggle CLI:
+
+```bash
+python scripts/publish_kaggle_dataset.py
+```
+
+Publisher отказывается брать dirty worktree, архивирует именно Git `HEAD` и
+пишет полный commit hash в `commit.txt`. Dataset по умолчанию:
+`timurakimoff/gemma-grpo-source`.
+
 ## Inputs ноутбука
 
 Создайте notebook из страницы соревнования и подключите четыре input:
@@ -63,7 +74,8 @@ print("commit:", commit)
 1. competition data `gemma-4-developer-agent`;
 2. модель `google/gemma-4` с вариантом `gemma-4-31b-it-qat-w4a16-ct`;
 3. официальный dataset `metric/gemma-4-developer-agent-wheelhouse`;
-4. private dataset с файлом `gemma-grpo-kaggle.zip` из этого проекта.
+4. private dataset `timurakimoff/gemma-grpo-source` с файлом
+   `gemma-grpo-kaggle.zip` из этого проекта.
 
 В Settings выберите `GPU L4 x4` и оставьте Internet выключенным.
 
