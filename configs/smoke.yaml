@@ -14,7 +14,9 @@ lora:
   r: 8
   alpha: 16
   dropout: 0.0
-  target_modules: all-linear
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  # vLLM serves only the language backbone; do not emit incompatible vision LoRA weights.
+  exclude_modules: '.*vision_tower.*'
 grpo:
   learning_rate: 5.0e-6
   beta: 0.01
@@ -43,21 +45,22 @@ rollout:
   timeout_seconds: null
   seeds: [101, 202, 303, 404]
   managed_vllm: true
+  # Roll out with the official inference-optimized QAT W4A16 checkpoint passed
+  # via --rollout-model-path; FSDP still trains model.name_or_path in NF4.
+  vllm_checkpoint_format: compressed-tensors
   vllm_port: 8000
-  # vLLM 0.19 cannot shard a pre-quantized BNB tensor with TP. Pipeline
-  # parallelism keeps each quantized tensor intact while using all four L4s.
-  vllm_tensor_parallel_size: 1
-  vllm_pipeline_parallel_size: 4
+  # Native compressed-tensors supports fast tensor parallel inference.
+  vllm_tensor_parallel_size: 4
+  vllm_pipeline_parallel_size: 1
   # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
   vllm_language_model_only: true
   # SWEGemma requests up to 16k completion tokens.  Keep rollout context
   # independent from the smaller 8k training filter used by this smoke test.
   vllm_max_model_len: 32768
-  # Rollouts are sequential. Avoid large CUDA-graph pools and reserve headroom
-  # for temporary BitsAndBytes dequantization buffers.
+  # Native W4 has enough headroom for CUDA graphs on four L4 shards.
   vllm_max_num_seqs: 1
-  vllm_enforce_eager: true
-  vllm_gpu_memory_utilization: 0.85
+  vllm_enforce_eager: false
+  vllm_gpu_memory_utilization: 0.9
   vllm_startup_timeout_seconds: 900
 reward:
   resolved: 1.0

@@ -107,10 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         results_root = Path(args.results_root).resolve()
         adapter = Path(args.adapter).resolve() if args.adapter else None
         model_path = args.model_path or config.model.name_or_path
+        rollout_model_path = Path(model_path).resolve()
         external_models_yaml = Path(args.models_yaml).resolve() if args.models_yaml else None
         with rollout_models_yaml(
             config=config,
-            model_path=model_path,
+            model_path=rollout_model_path,
             adapter=adapter,
             work_dir=results_root / "_vllm" / f"iter_{args.iteration:04d}",
             external_models_yaml=external_models_yaml,
@@ -126,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                 selected_ids=set(args.task_ids) if args.task_ids else None,
                 adapter=adapter,
                 models_yaml=models_yaml,
+                behavior_model_path=rollout_model_path,
             )
         summary = {
             "rollouts": len(rows),

@@ -25,6 +25,10 @@ class RolloutConfig:
     timeout_seconds: int | None = None
     seeds: tuple[int, ...] = (101, 202, 303, 404)
     managed_vllm: bool = True
+    # ``nf4`` uses the saved BitsAndBytes training checkpoint.  The faster
+    # ``compressed-tensors`` path serves the official QAT W4A16 checkpoint
+    # while FSDP continues to train the persistent NF4 copy.
+    vllm_checkpoint_format: str = "nf4"
     vllm_port: int = 8000
     vllm_tensor_parallel_size: int = 1
     vllm_pipeline_parallel_size: int = 4
@@ -58,6 +62,7 @@ class LoraConfigData:
     alpha: int = 32
     dropout: float = 0.0
     target_modules: str | list[str] = "all-linear"
+    exclude_modules: str | list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +171,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
             )
     if not 1 <= config.rollout.vllm_port <= 65535:
         raise ValueError("rollout.vllm_port must be a valid TCP port")
+    if config.rollout.vllm_checkpoint_format not in {"nf4", "compressed-tensors"}:
+        raise ValueError(
+            "rollout.vllm_checkpoint_format must be 'nf4' or 'compressed-tensors'"
+        )
     if config.rollout.vllm_tensor_parallel_size < 1:
         raise ValueError("rollout.vllm_tensor_parallel_size must be positive")
     if config.rollout.vllm_pipeline_parallel_size < 1:

@@ -12,6 +12,7 @@ from gemma_grpo.train import (
     _policy_state_dict,
     _project_action_logprobs,
     _selected_logprobs,
+    _stored_behavior_logprobs,
     _validate_trajectory,
 )
 
@@ -80,6 +81,14 @@ def test_chunked_action_logprobs_preserve_gemma_final_softcapping():
 def test_trajectory_positions_are_validated_before_model_loading():
     with pytest.raises(ValueError, match="between 1"):
         _validate_trajectory(TokenizedTrajectory(input_ids=[1, 2], action_positions=[2]))
+
+
+def test_stored_behavior_logprobs_are_validated():
+    row = {"seed": 101, "behavior_logprobs": [-0.1, -0.2]}
+
+    assert _stored_behavior_logprobs(row, expected_tokens=2) == [-0.1, -0.2]
+    with pytest.raises(ValueError, match="expected 3"):
+        _stored_behavior_logprobs(row, expected_tokens=3)
 
 
 def test_telemetry_file_is_not_overwritten(tmp_path):

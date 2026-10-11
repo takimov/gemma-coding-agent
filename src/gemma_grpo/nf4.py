@@ -49,6 +49,18 @@ def assert_nf4_checkpoint(path: str | Path, *, require_fsdp_storage: bool = True
             )
 
 
+def assert_compressed_w4_checkpoint(path: str | Path) -> None:
+    """Validate the official inference-optimized QAT W4 checkpoint."""
+    quantization = checkpoint_quantization(path)
+    method = str(quantization.get("quant_method") or "").lower()
+    if method != "compressed-tensors":
+        raise ValueError(
+            f"Expected a compressed-tensors QAT W4 checkpoint at {path}, "
+            f"got quant_method={method!r}. Pass the official "
+            "gemma-4-31b-it-qat-w4a16-ct directory as --rollout-model-path."
+        )
+
+
 def _requantize_linears_to_nf4(
     model: Any,
     *,

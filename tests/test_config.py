@@ -10,17 +10,19 @@ def test_default_config_has_matching_group_and_seeds():
     assert config.grpo.group_size == 4
     assert len(config.rollout.seeds) == 4
     assert config.lora.r == 16
+    assert config.lora.exclude_modules == ".*vision_tower.*"
     assert config.model.load_mode == "nf4"
     assert config.model.device_map is None
     assert config.distributed.strategy == "fsdp"
     assert config.distributed.num_processes == 4
     assert config.rollout.managed_vllm is True
-    assert config.rollout.vllm_tensor_parallel_size == 1
-    assert config.rollout.vllm_pipeline_parallel_size == 4
+    assert config.rollout.vllm_checkpoint_format == "compressed-tensors"
+    assert config.rollout.vllm_tensor_parallel_size == 4
+    assert config.rollout.vllm_pipeline_parallel_size == 1
     assert config.rollout.vllm_language_model_only is True
     assert config.rollout.vllm_max_model_len == 32768
     assert config.rollout.vllm_max_num_seqs == 1
-    assert config.rollout.vllm_enforce_eager is True
+    assert config.rollout.vllm_enforce_eager is False
     assert config.grpo.logprob_chunk_size == 32
     assert config.grpo.monitor_interval_seconds == 5
 
@@ -51,5 +53,18 @@ rollout: {seeds: [1, 2, 3, 4]}
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="divisible"):
+        load_config(path)
+
+
+def test_unknown_rollout_checkpoint_format_is_rejected(tmp_path):
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        """
+model: {name_or_path: model}
+rollout: {vllm_checkpoint_format: int3}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="vllm_checkpoint_format"):
         load_config(path)
 

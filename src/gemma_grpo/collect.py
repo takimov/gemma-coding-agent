@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from .behavior import attach_behavior_logprobs
 from .config import ExperimentConfig
 from .groups import add_group_advantages
 from .policy import adapter_fingerprint
@@ -123,6 +124,7 @@ def collect_rollouts(
     selected_ids: set[str] | None = None,
     adapter: Path | None = None,
     models_yaml: Path | None = None,
+    behavior_model_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     tasks = select_tasks(read_jsonl(tasks_path), selected_ids)
     policy_id = adapter_fingerprint(adapter) if adapter is not None else "base"
@@ -200,6 +202,7 @@ def collect_rollouts(
                 "iteration": iteration,
                 "seed": seed,
                 "policy_id": policy_id,
+                "behavior_checkpoint_format": config.rollout.vllm_checkpoint_format,
                 "reward": reward,
                 "resolved": outcome.resolved,
                 "scorable": scorable,
@@ -221,6 +224,22 @@ def collect_rollouts(
             rows.append(row)
 
     normalized = add_group_advantages(rows)
+    if (
+        config.rollout.managed_vllm
+        and config.rollout.vllm_checkpoint_format == "compressed-tensors"
+    ):
+        if behavior_model_path is None:
+            raise ValueError(
+                "Native W4 rollout requires behavior_model_path to capture exact "
+                "behavior-policy log-probabilities"
+            )
+        normalized = attach_behavior_logprobs(
+            normalized,
+            tokenizer_path=behavior_model_path,
+            api_base=f"http://127.0.0.1:{config.rollout.vllm_port}/v1",
+            model="main_lora" if adapter is not None else "gemma-4-31b-it-qat-w4a16-ct",
+            trust_remote_code=config.model.trust_remote_code,
+        )
     for row in normalized:
         append_jsonl(output_path, row)
     return normalized

@@ -1,9 +1,9 @@
-# Kaggle 4×L4: FSDP + QLoRA + NF4 rollout
+# Kaggle 4×L4: native W4 rollout + FSDP-QLoRA NF4 training
 
-Notebook работает с выключенным Internet. Managed loop использует один
-постоянный NF4 checkpoint и сам чередует vLLM PP=4 с FSDP `FULL_SHARD`=4.
-Одновременно эти процессы не живут: перед training vLLM завершается и отдаёт
-всю VRAM.
+Notebook работает с выключенным Internet. Managed loop чередует быстрый native
+QAT W4A16 vLLM (`TP=4`) с FSDP `FULL_SHARD`=4 на постоянном NF4 checkpoint.
+Оба checkpoint'а существуют заранее; между фазами переносится только adapter.
+Перед training vLLM завершается и отдаёт всю VRAM.
 
 ## Обновление private source dataset
 
@@ -178,12 +178,12 @@ if not is_nf4(NF4_DIR, {"bfloat16", "torch.bfloat16"}):
         cwd=PROJECT,
     )
 
-print("persistent shared NF4 checkpoint:", NF4_DIR)
+print("persistent training NF4 checkpoint:", NF4_DIR)
 ```
 
-Только первый шаг распаковывает W4 и квантует веса. Managed vLLM потоково
-создаёт uint8 views поверх загружаемых packed BF16 tensors; на диске ничего не
-дублируется. Сохраните эту директорию как notebook output для следующих сессий.
+Только первый шаг распаковывает W4 и квантует training-веса. Для rollout vLLM
+читает исходный `source_w4` прямо из Kaggle Input; NF4 используется FSDP.
+Сохраните NF4 directory как notebook output для следующих сессий.
 
 ## Ячейка 3 — preflight
 
@@ -196,14 +196,15 @@ subprocess.run(
         "--snapshots-dir", str(data_root / "snapshots"),
         "--submission-dir", str(PROJECT / "submission"),
         "--model-path", str(NF4_DIR),
+        "--rollout-model-path", str(source_w4),
     ],
     check=True,
     cwd=PROJECT,
 )
 ```
 
-Preflight должен подтвердить BNB ≥0.48.1, общий BF16-storage NF4 checkpoint,
-runtime bitcast shim, встроенный BNB loader и четыре CUDA device.
+Preflight должен подтвердить BNB ≥0.48.1, training NF4 checkpoint, rollout
+`compressed-tensors` W4 checkpoint и четыре CUDA device.
 Managed server также включает `--language-model-only`: SWEGemma coding tasks не
 содержат изображений, а vision tower этого checkpoint не нужен для rollout.
 Rollout context остаётся 32768 независимо от `grpo.max_seq_length`: smoke
@@ -211,16 +212,15 @@ Rollout context остаётся 32768 независимо от `grpo.max_seq_l
 токенов у inference server.
 Вывод managed vLLM одновременно показывается в stdout notebook и сохраняется в
 `<run>/vllm/collection_NNNN/vllm.log`.
-Для последовательных rollout'ов сервер использует eager execution и
-`max_num_seqs=1`: это исключает CUDA-graph pools, которые после выделения KV
-cache не помещаются в 22 GiB L4. `gpu_memory_utilization=0.85` оставляет запас
-для временных BitsAndBytes buffers.
+Native W4 использует `TP=4`, CUDA graphs и `max_num_seqs=1`. Это тот же быстрый
+inference-класс, на котором были собраны первые smoke rollout'ы с разными
+rewards. NF4/BitsAndBytes runtime shim в этой фазе намеренно не загружается.
+После появления reward variance loop делает короткий scoring pass по action
+tokens и сохраняет точные W4 `behavior_logprobs`; в stdout виден прогресс
+`[rollout] scoring W4 behavior logprobs N/4`.
 Managed server передаёт Gemma 4 reasoning boundaries (`<|channel>` и
 `<channel|>`) через `--reasoning-config`, поэтому запросы SWEGemma с
 `thinking_token_budget` принимаются vLLM 0.19.1.
-Runtime shim также удаляет отсутствующие optional Gemma 4 tensors перед
-pipeline-parallel transport: vLLM 0.19.1 иначе пытается срезать значение
-`None` как тензор на следующем PP rank.
 
 ## Ячейка 4 — обязательный smoke
 
@@ -243,6 +243,7 @@ command = [
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
     "--model-path", str(NF4_DIR),
+    "--rollout-model-path", str(source_w4),
     "--task-id", TASK_IDS[0],
     "--work-dir", str(smoke_dir),
     "--target-steps", "1",
@@ -256,8 +257,8 @@ subprocess.run(command, check=True, cwd=PROJECT)
 Ожидаемая последовательность лога:
 
 ```text
-[vllm] starting NF4 server
-[vllm] NF4 server ready
+[vllm] starting compressed-tensors server
+[vllm] compressed-tensors server ready
 [loop] collection ...
 [vllm] stopped; GPUs released for FSDP
 [train] launching FSDP-QLoRA on 4 GPUs
@@ -266,6 +267,8 @@ subprocess.run(command, check=True, cwd=PROJECT)
 В группе теперь четыре seed: один rollout попадает на один FSDP rank. В
 training telemetry должны одновременно появляться все четыре GPU, а не прежняя
 пила последовательного `device_map`.
+В `training_metrics.json` проверьте `importance_clip_fraction`: это доля action
+tokens, для которых различие W4 behavior и NF4 policy вышло за GRPO clip range.
 
 ```python
 telemetry = max(
@@ -296,6 +299,7 @@ command = [
     "--snapshots-dir", str(data_root / "snapshots"),
     "--submission-dir", str(PROJECT / "submission"),
     "--model-path", str(NF4_DIR),
+    "--rollout-model-path", str(source_w4),
     "--work-dir", str(run_dir),
     "--target-steps", "100",
     "--max-collections", "200",
@@ -333,7 +337,7 @@ subprocess.run(
 print(submission_zip, round(submission_zip.stat().st_size / 2**20, 1), "MiB")
 ```
 
-Перед submission отдельно проверьте adapter с официальным W4 base: competition
-evaluator использует W4, тогда как on-policy train/rollout теперь согласованы на
-NF4. Совместимость имён LoRA-модулей сохраняется, но logits двух base formats не
-bit-exact.
+Перед submission отдельно проверьте adapter с официальным W4 base. Rollout и
+competition evaluator используют W4, training — NF4; exact W4 behavior
+log-probabilities корректируют это различие в clipped ratio, но logits двух base
+formats всё равно не bit-exact.

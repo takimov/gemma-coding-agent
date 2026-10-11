@@ -1,23 +1,21 @@
 # Аудит FSDP-QLoRA GRPO path
 
 Дата: 2026-10-11. Цель: Gemma 4 31B, Kaggle 4×NVIDIA L4 22 GiB,
-rollout и training из одного сохранённого NF4 checkpoint.
+быстрый rollout на официальном QAT W4A16 и FSDP-QLoRA training на NF4.
 
 ## Новый lifecycle
 
 ```text
-saved BF16-storage NF4 base
-    ├─ streaming lossless uint8 views → vLLM built-in BNB, PP=4
-    │                                  → SWEGemma rollouts → stop
-    └─ 4 train ranks, FSDP FULL_SHARD + QLoRA → save LoRA adapter
-                                                    │
-                                                    └─ next rollout
+official QAT W4A16 base → native compressed-tensors vLLM, TP=4
+                         → SWEGemma rollouts → stop
+saved BF16-storage NF4 base → 4 train ranks, FSDP FULL_SHARD + QLoRA
+                             → save LoRA adapter → next W4 rollout
 ```
 
-Оригинальный competition W4 checkpoint участвует только в одноразовой
-`convert-nf4`. Каждый следующий collect/train перечитывает один NF4 checkpoint
-с диска. vLLM bitcast'ит только загружаемые packed tensors в RAM; W4 не
-распаковывается, повторной квантизации и второй 17 GiB копии на диске нет.
+Оригинальный competition W4 checkpoint остаётся смонтированным в Kaggle Input и
+используется каждым collect без преобразования. Training перечитывает один
+сохранённый NF4 checkpoint. Между ними передаётся только LoRA adapter; второй
+W4 checkpoint на writable disk не создаётся.
 
 ## Что исправлено
 
@@ -25,10 +23,10 @@ saved BF16-storage NF4 base
 |---|---|---|
 | P0 | Последовательный `device_map` нагружал GPU по очереди | Четыре FSDP rank, `FULL_SHARD`, одна trajectory/rank |
 | P0 | Каждый update делал W4 → BF16 → NF4 | Один постоянный pre-quantized NF4 checkpoint |
-| P0 | Rollout был W4, training NF4 | Managed vLLM читает те же NF4-байты через streaming uint8 view без requantization |
-| P0 | Внешний BNB plugin новее vLLM 0.19.1 | Используется встроенный loader 0.19.1, внешний plugin отключён через `VLLM_PLUGINS=""` |
-| P0 | vLLM 0.19 не поддерживает pre-quantized BNB при TP>1 | Rollout использует PP=4 и сохраняет quantized tensors целыми |
+| P0 | NF4 rollout через PP=4 давал около 10.7 tok/s | Rollout возвращён на native QAT W4A16 `compressed-tensors`, TP=4 |
+| P0 | Полные веса могли переквантовываться между фазами | W4 и NF4 существуют постоянно; переносится только LoRA adapter |
 | P0 | vLLM создавал dense vision layers, но checkpoint хранил их в NF4 | Для текстовых SWEGemma задач включён `--language-model-only`; vision tower не создаётся |
+| P0 | `all-linear` мог сохранить vision LoRA, которую language-only vLLM не загрузит | LoRA targets ограничены language attention/MLP, `vision_tower` исключён |
 | P0 | Полный FP32 `action_tokens × 262144` tensor давал OOM 6.42 GiB | Selective hidden states и chunked lm_head/log-softmax |
 | P0 | Разное число ATIF segments на ranks нарушает порядок FSDP collectives | Tiny zero-loss padding forwards участвуют и в backward graph |
 | P1 | Checkpointed lm_head мог обратиться к уже reshared weight | Frozen tied embedding/lm_head реплицирован BF16 и исключён из FSDP |
@@ -60,10 +58,15 @@ rank считает loss своей trajectory. FSDP усредняет gradient
 несколько trajectories, local loss сначала усредняется локально. Metrics затем
 суммируются через `accelerator.reduce`.
 
-До первого optimizer step для всех выбранных групп фиксируются:
+Для каждой trainable W4 trajectory до остановки vLLM сохраняются точные
+behavior log-probabilities наблюдённых action tokens. До первого optimizer step
+также фиксируются:
 
-- behavior-policy log-probabilities с текущим adapter;
 - reference log-probabilities того же NF4 base с отключённым adapter.
+
+Clipped ratio поэтому использует `new_nf4 / behavior_w4`, а не суррогатный
+`new_nf4 / old_nf4`. Training metrics публикуют средний сдвиг log-prob,
+средний importance ratio и clip fraction.
 
 Adapter fingerprint запрещает обучать rollout не той starting policy. После
 завершения update нужны новые rollout'ы.
@@ -122,19 +125,20 @@ assistant call.
 
 ### Final W4 evaluator
 
-On-policy пара теперь согласована внутри NF4: rollout и trainer используют один
-base. Но competition submission будет исполняться на официальном QAT W4 base.
-LoRA module names совместимы, logits не bit-exact. Нужен отдельный W4 regression
-eval перед отправкой; это eval, а не возврат W4 в training loop.
+Rollout и competition evaluator используют официальный QAT W4 base, а trainer —
+его постоянную NF4-копию. Имена LoRA-модулей совместимы, но logits не bit-exact,
+поэтому update слегка off-policy. Риск ограничивается одним epoch/update,
+небольшим learning rate и свежими rollout'ами после каждого update. Перед
+длинным run нужно сравнить log-prob/качество W4 и NF4 на нескольких traces.
 
 ## Критерии успешного smoke
 
-1. Preflight подтверждает BNB ≥0.48.1, общий NF4 checkpoint, runtime shim, встроенный BNB loader и 4 GPU.
-2. vLLM запускает NF4 PP=4, возвращает `/v1/models`, собирает 4 scorable rollout'а.
+1. Preflight подтверждает training NF4, rollout QAT W4A16 и 4 GPU.
+2. vLLM запускает native W4 TP=4, возвращает `/v1/models`, собирает 4 scorable rollout'а.
 3. Перед training в логе есть `[vllm] stopped`.
 4. FSDP world size равен 4; каждый rank получает trajectory.
 5. Завершаются old/reference cache, forward/backward и ровно один optimizer step.
 6. Loss, KL и grad norm конечны; telemetry не показывает OOM/CPU offload.
 7. Созданы `adapter_config.json`, `adapter_model.safetensors` и
    `training_metrics.json`.
-8. Следующий managed vLLM стартует с сохранённым adapter и свежими seeds.
+8. Следующий native W4 vLLM стартует с сохранённым adapter и свежими seeds.

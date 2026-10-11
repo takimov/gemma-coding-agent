@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from gemma_grpo.nf4 import (
+    assert_compressed_w4_checkpoint,
     _replace_source_quantizer_for_save,
     _save_nf4_model,
     assert_nf4_checkpoint,
@@ -32,6 +33,28 @@ def test_saved_nf4_checkpoint_is_accepted_for_fsdp(tmp_path):
     )
 
     assert_nf4_checkpoint(model)
+
+
+def test_compressed_tensors_checkpoint_is_accepted_for_native_rollout(tmp_path):
+    model = tmp_path / "model"
+    _write_config(model, {"quant_method": "compressed-tensors"})
+
+    assert_compressed_w4_checkpoint(model)
+
+
+def test_nf4_checkpoint_is_rejected_for_native_rollout(tmp_path):
+    model = tmp_path / "model"
+    _write_config(
+        model,
+        {
+            "quant_method": "bitsandbytes",
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+        },
+    )
+
+    with pytest.raises(ValueError, match="compressed-tensors"):
+        assert_compressed_w4_checkpoint(model)
 
 
 def test_uint8_nf4_checkpoint_is_rejected_for_fsdp(tmp_path):

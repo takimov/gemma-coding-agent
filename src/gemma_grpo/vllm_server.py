@@ -16,7 +16,7 @@ from typing import Iterator, TextIO
 import yaml
 
 from .config import ExperimentConfig
-from .nf4 import assert_nf4_checkpoint
+from .nf4 import assert_compressed_w4_checkpoint, assert_nf4_checkpoint
 
 
 BASE_MODEL_ALIAS = "gemma-4-31b-it-qat-w4a16-ct"
@@ -36,18 +36,29 @@ def _tee_stream(source: TextIO, *destinations: TextIO) -> None:
             destination.flush()
 
 
-def vllm_environment() -> dict[str, str]:
-    """Return an environment that patches every spawned vLLM worker."""
+def vllm_environment(*, enable_nf4_compat: bool = True) -> dict[str, str]:
+    """Return an isolated environment for the selected vLLM weight backend."""
     environment = os.environ.copy()
     environment.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     environment["VLLM_PLUGINS"] = ""
-    environment["GEMMA_GRPO_VLLM_BNB_COMPAT"] = "1"
     environment["VLLM_NO_USAGE_STATS"] = "1"
     environment["DO_NOT_TRACK"] = "1"
-    existing = environment.get("PYTHONPATH")
-    environment["PYTHONPATH"] = str(VLLM_COMPAT_SITE) + (
-        os.pathsep + existing if existing else ""
-    )
+    existing_paths = [
+        item
+        for item in environment.get("PYTHONPATH", "").split(os.pathsep)
+        if item and Path(item) != VLLM_COMPAT_SITE
+    ]
+    if enable_nf4_compat:
+        environment["GEMMA_GRPO_VLLM_BNB_COMPAT"] = "1"
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [str(VLLM_COMPAT_SITE), *existing_paths]
+        )
+    else:
+        environment.pop("GEMMA_GRPO_VLLM_BNB_COMPAT", None)
+        if existing_paths:
+            environment["PYTHONPATH"] = os.pathsep.join(existing_paths)
+        else:
+            environment.pop("PYTHONPATH", None)
     return environment
 
 
@@ -92,8 +103,19 @@ class ManagedVllmServer:
         self.log_path = self.work_dir / "vllm.log"
         self.models_yaml = self.work_dir / "models.yaml"
 
+    @property
+    def checkpoint_format(self) -> str:
+        return self.config.rollout.vllm_checkpoint_format
+
+    @property
+    def uses_nf4(self) -> bool:
+        return self.checkpoint_format == "nf4"
+
+    def _environment(self) -> dict[str, str]:
+        return vllm_environment(enable_nf4_compat=self.uses_nf4)
+
     def _supported_flags(self) -> str:
-        environment = vllm_environment()
+        environment = self._environment()
         completed = subprocess.run(
             [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--help"],
             text=True,
@@ -136,8 +158,9 @@ class ManagedVllmServer:
             if flag in flags:
                 command.extend([flag, *values])
 
-        add("--quantization", "bitsandbytes")
-        add("--load-format", "bitsandbytes")
+        if self.uses_nf4:
+            add("--quantization", "bitsandbytes")
+            add("--load-format", "bitsandbytes")
         add("--tool-call-parser", "gemma4")
         add("--reasoning-parser", "gemma4")
         add("--reasoning-config", json.dumps(GEMMA4_REASONING_CONFIG))
@@ -197,7 +220,10 @@ class ManagedVllmServer:
             return "(vLLM log unavailable)"
 
     def start(self) -> Path:
-        assert_nf4_checkpoint(self.model_path, require_fsdp_storage=True)
+        if self.uses_nf4:
+            assert_nf4_checkpoint(self.model_path, require_fsdp_storage=True)
+        else:
+            assert_compressed_w4_checkpoint(self.model_path)
         if self.adapter is not None:
             for filename in ("adapter_config.json", "adapter_model.safetensors"):
                 if not (self.adapter / filename).is_file():
@@ -209,9 +235,13 @@ class ManagedVllmServer:
             adapter=self.adapter,
         )
         self._log_handle = self.log_path.open("w", encoding="utf-8")
-        environment = vllm_environment()
+        environment = self._environment()
         command = self._command()
-        print(f"[vllm] starting NF4 server; log={self.log_path}", flush=True)
+        print(
+            f"[vllm] starting {self.checkpoint_format} server; "
+            f"model={self.model_path}; log={self.log_path}",
+            flush=True,
+        )
         self.process = subprocess.Popen(
             command,
             text=True,
@@ -238,7 +268,7 @@ class ManagedVllmServer:
                     f"vLLM exited during startup with code {code}:\n{self._log_tail()}"
                 )
             if self._health():
-                print("[vllm] NF4 server ready", flush=True)
+                print(f"[vllm] {self.checkpoint_format} server ready", flush=True)
                 return self.models_yaml
             time.sleep(2)
         self.stop()

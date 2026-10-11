@@ -156,6 +156,9 @@ def run_training_loop(
                 Path(state["current_adapter"]) if state.get("current_adapter") else None
             )
             collection_config = _config_for_collection(config, collection_index)
+            active_rollout_model = Path(
+                rollout_model_path or model_path or config.model.name_or_path
+            ).resolve()
             print(
                 f"[loop] collecting #{collection_index} with policy "
                 f"{current_adapter or 'base'}; steps={state['optimizer_steps']}/{target_steps}",
@@ -163,7 +166,7 @@ def run_training_loop(
             )
             with rollout_models_yaml(
                 config=collection_config,
-                model_path=rollout_model_path or model_path or config.model.name_or_path,
+                model_path=active_rollout_model,
                 adapter=current_adapter,
                 work_dir=work_dir / "vllm" / f"collection_{collection_index:04d}",
                 external_models_yaml=models_yaml,
@@ -179,6 +182,7 @@ def run_training_loop(
                     selected_ids=selected_ids,
                     adapter=current_adapter,
                     models_yaml=active_models_yaml,
+                    behavior_model_path=active_rollout_model,
                 )
             trainable_groups = sorted(
                 {str(row["group_id"]) for row in rows if row.get("trainable")}

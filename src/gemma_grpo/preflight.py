@@ -13,7 +13,7 @@ import yaml
 from packaging.version import InvalidVersion, Version
 
 from .config import ExperimentConfig
-from .nf4 import assert_nf4_checkpoint
+from .nf4 import assert_compressed_w4_checkpoint, assert_nf4_checkpoint
 from .tasks import read_jsonl
 from .tokenization import assert_prefix_preserving
 from .vllm_server import vllm_environment
@@ -188,14 +188,24 @@ def run_preflight(
         if config.rollout.managed_vllm:
             rollout_path = rollout_model_path or model_path or config.model.name_or_path
             try:
-                assert_nf4_checkpoint(rollout_path, require_fsdp_storage=True)
+                if config.rollout.vllm_checkpoint_format == "nf4":
+                    assert_nf4_checkpoint(rollout_path, require_fsdp_storage=True)
+                    check_name = "shared rollout NF4 checkpoint"
+                else:
+                    assert_compressed_w4_checkpoint(rollout_path)
+                    check_name = "rollout QAT W4A16 checkpoint"
                 record(
-                    "shared rollout NF4 checkpoint",
+                    check_name,
                     True,
                     str(Path(rollout_path)),
                 )
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-                record("shared rollout NF4 checkpoint", False, str(error))
+                check_name = (
+                    "shared rollout NF4 checkpoint"
+                    if config.rollout.vllm_checkpoint_format == "nf4"
+                    else "rollout QAT W4A16 checkpoint"
+                )
+                record(check_name, False, str(error))
 
     try:
         import torch
@@ -221,29 +231,31 @@ def run_preflight(
         record("CUDA device count", False, str(error))
 
     if config.rollout.managed_vllm:
-        environment = vllm_environment()
-        builtin = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from vllm.model_executor.layers.quantization.bitsandbytes "
-                "import BitsAndBytesConfig; "
-                "config=BitsAndBytesConfig.from_config({"
-                "'load_in_4bit': True, 'bnb_4bit_quant_type': 'nf4', "
-                "'bnb_4bit_quant_storage': 'bfloat16'}); "
-                "assert config.bnb_4bit_quant_storage == 'uint8'; print('ok')",
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=environment,
-        )
-        builtin_ok = builtin.returncode == 0 and builtin.stdout.strip().endswith("ok")
-        record(
-            "vLLM built-in BitsAndBytes",
-            builtin_ok,
-            "ok" if builtin_ok else builtin.stdout[-2000:],
-        )
+        uses_nf4 = config.rollout.vllm_checkpoint_format == "nf4"
+        environment = vllm_environment(enable_nf4_compat=uses_nf4)
+        if uses_nf4:
+            builtin = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from vllm.model_executor.layers.quantization.bitsandbytes "
+                    "import BitsAndBytesConfig; "
+                    "config=BitsAndBytesConfig.from_config({"
+                    "'load_in_4bit': True, 'bnb_4bit_quant_type': 'nf4', "
+                    "'bnb_4bit_quant_storage': 'bfloat16'}); "
+                    "assert config.bnb_4bit_quant_storage == 'uint8'; print('ok')",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+            )
+            builtin_ok = builtin.returncode == 0 and builtin.stdout.strip().endswith("ok")
+            record(
+                "vLLM built-in BitsAndBytes",
+                builtin_ok,
+                "ok" if builtin_ok else builtin.stdout[-2000:],
+            )
         completed = subprocess.run(
             [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--help"],
             text=True,
@@ -257,8 +269,6 @@ def run_preflight(
             "--max-model-len",
             "--max-num-seqs",
             "--served-model-name",
-            "--quantization",
-            "--load-format",
             "--reasoning-parser",
             "--reasoning-config",
             "--enable-lora",
@@ -266,13 +276,15 @@ def run_preflight(
             "--max-lora-rank",
             "--max-loras",
         ]
+        if uses_nf4:
+            required_flags.extend(["--quantization", "--load-format"])
         if config.rollout.vllm_language_model_only:
             required_flags.append("--language-model-only")
         if config.rollout.vllm_enforce_eager:
             required_flags.append("--enforce-eager")
         missing = [flag for flag in required_flags if flag not in completed.stdout]
         record(
-            "managed vLLM NF4/LoRA flags",
+            f"managed vLLM {config.rollout.vllm_checkpoint_format}/LoRA flags",
             completed.returncode == 0 and not missing,
             "ok" if not missing else f"missing: {', '.join(missing)}",
         )

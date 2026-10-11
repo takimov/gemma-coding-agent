@@ -1,6 +1,6 @@
 model:
-  # Persistent output of the one-time W4 -> NF4 conversion. The same directory
-  # is loaded by managed vLLM rollout and by FSDP-QLoRA training.
+  # Persistent output of the one-time W4 -> NF4 conversion. This checkpoint is
+  # used only by FSDP-QLoRA; rollout receives the official W4 path separately.
   name_or_path: /kaggle/working/models/gemma-4-31b-nf4
   trust_remote_code: false
   torch_dtype: bfloat16
@@ -18,7 +18,8 @@ lora:
   r: 16
   alpha: 32
   dropout: 0.0
-  target_modules: all-linear
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  exclude_modules: '.*vision_tower.*'
 
 grpo:
   learning_rate: 5.0e-6
@@ -46,22 +47,22 @@ rollout:
   # Kept in submission/eval_config.yaml; null avoids relying on a version-specific CLI flag.
   timeout_seconds: null
   seeds: [101, 202, 303, 404]
-  # The loop owns vLLM: it streams byte views from the shared BF16-storage NF4
-  # checkpoint, then stops before spawning four FSDP ranks on the same files.
+  # The loop owns vLLM. Rollouts use the official QAT W4A16 checkpoint supplied
+  # via --rollout-model-path; training remains on the persistent NF4 checkpoint.
   managed_vllm: true
+  vllm_checkpoint_format: compressed-tensors
   vllm_port: 8000
-  # Pre-quantized BNB uses pipeline rather than tensor parallelism in vLLM 0.19.
-  vllm_tensor_parallel_size: 1
-  vllm_pipeline_parallel_size: 4
+  vllm_tensor_parallel_size: 4
+  vllm_pipeline_parallel_size: 1
   # SWEGemma coding tasks are text-only; do not instantiate the vision tower.
   vllm_language_model_only: true
   # Gemma 4's full context; SWEGemma requests up to 16k completion tokens.
   vllm_max_model_len: 32768
-  # Collection concurrency is one, so graph capture and multi-sequence
-  # reservation only consume VRAM without increasing rollout throughput.
+  # Keep one sequence for now; native W4 tensor parallelism already restores
+  # the fast inference path used by the original smoke test.
   vllm_max_num_seqs: 1
-  vllm_enforce_eager: true
-  vllm_gpu_memory_utilization: 0.85
+  vllm_enforce_eager: false
+  vllm_gpu_memory_utilization: 0.9
   vllm_startup_timeout_seconds: 900
 
 reward:
