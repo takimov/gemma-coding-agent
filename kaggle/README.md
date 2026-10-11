@@ -206,6 +206,9 @@ Preflight должен подтвердить BNB ≥0.48.1, общий BF16-sto
 runtime bitcast shim, встроенный BNB loader и четыре CUDA device.
 Managed server также включает `--language-model-only`: SWEGemma coding tasks не
 содержат изображений, а vision tower этого checkpoint не нужен для rollout.
+Rollout context остаётся 32768 независимо от `grpo.max_seq_length`: smoke
+фильтрует обучающие траектории по 8192, но SWEGemma запрашивает до 16384 новых
+токенов у inference server.
 
 ## Ячейка 4 — обязательный smoke
 

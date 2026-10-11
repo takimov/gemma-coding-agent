@@ -113,7 +113,7 @@ class ManagedVllmServer:
             "--gpu-memory-utilization",
             str(rollout.vllm_gpu_memory_utilization),
             "--max-model-len",
-            str(self.config.grpo.max_seq_length),
+            str(rollout.vllm_max_model_len),
         ]
 
         def add(flag: str, *values: str) -> None:

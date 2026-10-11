@@ -41,6 +41,7 @@ def test_managed_vllm_uses_pipeline_parallel_for_prequantized_nf4(tmp_path, monk
 
     assert command[command.index("--tensor-parallel-size") + 1] == "1"
     assert command[command.index("--pipeline-parallel-size") + 1] == "4"
+    assert command[command.index("--max-model-len") + 1] == "32768"
     assert "--language-model-only" in command
 
 
